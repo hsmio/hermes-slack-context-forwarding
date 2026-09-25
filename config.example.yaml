@@ -1,0 +1,5 @@
+platforms:
+  slack:
+    extra:
+      history_backfill: true
+      history_backfill_limit: 15
