@@ -11,10 +11,10 @@ It does not replace Slack setup or credentials. It subclasses the Slack adapter 
 
 ## Compatibility
 
-This release targets **Hermes Agent 0.19.x** and declares:
+This release targets **Hermes Agent 0.21.5–0.21.x** and declares:
 
 ```yaml
-requires_hermes: ">=0.19.0,<0.20.0"
+requires_hermes: ">=0.21.5,<0.22.0"
 ```
 
 The plugin necessarily calls private Slack-adapter helpers because Hermes does not currently expose public extension hooks for inbound message normalization. Treat each new Hermes minor release as a compatibility boundary: update Hermes on a test instance, run the validation commands below, then widen the version constraint only after the Slack tests pass.
@@ -42,7 +42,7 @@ Extract the archive beneath the target profile's plugin directory:
 ```bash
 export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 mkdir -p "$HERMES_HOME/plugins/slack-context-forwarding"
-tar -xzf hermes-slack-context-forwarding-0.1.0.tar.gz \
+tar -xzf hermes-slack-context-forwarding-0.2.0.tar.gz \
   --strip-components=1 \
   -C "$HERMES_HOME/plugins/slack-context-forwarding"
 hermes plugins enable slack-context-forwarding
@@ -74,7 +74,7 @@ platforms:
       history_backfill_limit: 15
 ```
 
-The history limit is clamped to `0`–`100`; the assembled channel-context block is capped at 12,000 characters. Forwarded text is separately capped at 12,000 characters.
+The history limit is clamped to `0`–`100`; the assembled channel-context block is capped at 12,000 characters. The complete quoted forwarded-content block (text and file markers together) is separately capped at 12,000 characters. This is message-count based, not a rolling time window.
 
 ### Slack scopes
 
@@ -102,7 +102,7 @@ On an explicitly addressed top-level channel message, the plugin scans backward 
 
 ### Forwarded messages
 
-The plugin recognizes Slack native shared-message/message-unfurl attachments, deduplicates equivalent flat-text and Block Kit representations, and suppresses automatic self-unfurl echoes from Hermes. Nested files are merged into the ordinary Slack event file list with provenance-aware deduplication; the more complete Slack file record wins.
+The plugin recognizes explicit Slack native shared-message attachments (`is_share`), deduplicates equivalent flat-text and Block Kit representations, and ignores ordinary pasted-message previews (including automatic self-unfurl echoes). Nested files are merged into the ordinary Slack event file list **after** the bundled adapter's authorization and routing checks, with provenance-aware deduplication; the more complete Slack file record wins. Previews without `is_share` are deliberately not treated as forwards.
 
 Forwarded material is framed as untrusted quoted content. A forwarded file is also named inside that frame, for example:
 
@@ -119,14 +119,14 @@ python -m py_compile __init__.py
 python tests/test_plugin.py
 ```
 
-Hermes builds that provide the newer plugin validation commands can additionally run:
+On Hermes 0.21.5, also run:
 
 ```bash
 hermes plugins doctor . --ci
 hermes plugins validate .
 ```
 
-The 0.19.0 Docker build used to develop this release predates those two CLI subcommands, so the executable smoke test is the portable baseline. If `pytest` is installed, the same assertions can also be run with `python -m pytest -q tests`.
+If `pytest` is installed, the same assertions can also be run with `python -m pytest -q tests`.
 
 On deployments that use a dedicated Hermes virtual environment, invoke that environment's `hermes` and `python` executables.
 
