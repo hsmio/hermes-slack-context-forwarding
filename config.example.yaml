@@ -3,3 +3,4 @@ platforms:
     extra:
       history_backfill: true
       history_backfill_limit: 15
+      linked_thread_max_messages: 100

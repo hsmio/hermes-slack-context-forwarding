@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 — Linked and forwarded source threads
+
+- Resolve authored Slack message permalinks and native forwards with a usable source reference through the existing workspace-scoped bot client.
+- Fetch bounded, paginated source threads and distinguish their root from the specific shared message.
+- On a later mention in a thread, inspect its root for a link or forward even if the root never addressed Hermes.
+- Reject cross-channel private/DM source lookups by default (checking `conversations.info`, not channel-ID prefixes); report inaccessible, unverifiable, or truncated references explicitly.
+- Try an exact lookup for a shared reply beyond the bounded thread scan and reuse the bundled thread cache when inspecting a parent on a later mention.
+- Add regressions for reply links, root links, forward references, delayed mentions, pagination, spoofed hosts, and privacy boundaries.
+
 ## 0.2.0 — Hermes 0.21.5 compatibility
 
 - Use the bundled adapter's new `_collect_inbound_media` seam after normal authorization/routing instead of wrapping the full inbound handler.
