@@ -43,7 +43,7 @@ Extract the archive beneath the target profile's plugin directory:
 ```bash
 export HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 mkdir -p "$HERMES_HOME/plugins/slack-context-forwarding"
-tar -xzf hermes-slack-context-forwarding-0.3.0.tar.gz \
+tar -xzf hermes-slack-context-forwarding-0.3.1.tar.gz \
   --strip-components=1 \
   -C "$HERMES_HOME/plugins/slack-context-forwarding"
 hermes plugins enable slack-context-forwarding
@@ -93,6 +93,14 @@ Forwarded files remain subject to Slack visibility, OAuth scopes, workspace memb
 Source-thread retrieval uses the same bot token and requires the corresponding history scope and bot membership in the **source** conversation. Cross-channel public-channel resolution also requires `channels:read` for `conversations.info` to verify visibility; if that check fails the plugin does not fetch the thread. An inaccessible reference cannot be resolved from its URL alone.
 
 ## Behavior
+
+### Current-message provenance (0.3.1)
+
+Every accepted non-command, non-synthetic inbound message receives a separate provenance block **prepended to `event.channel_context`**. It identifies the current channel/message timestamp and permalink, and separately labels the thread-root timestamp/permalink (the current message itself for a top-level post). This does not alter `event.text`; existing forwarded-content rendering remains unchanged. Commands and `_hermes_force_process` events bypass plugin enrichment entirely.
+
+Permalinks come only from Slack `chat.getPermalink` using the existing channel/team-selected workspace client. Each unique current/root timestamp gets one attempt bounded to two seconds, with SDK retries disabled on a shallow client copy, leaving the shared client's retry policy unchanged. The existing Slack URL parser must confirm the returned channel and timestamp. No URL is guessed. Failure or malformed identity is shown as an unavailable status and the message still runs; exception logging contains the class only, never raw exception data. A root equal to the current message reuses its result, including failures.
+
+The block distinguishes current feedback from its thread anchor and linked/forwarded source references: cite the actual feedback message, not the source link it quotes; ask only when required identity or link is unavailable. Historical channel/thread lines retain validated channel/timestamp IDs, preserving native `[thread parent]`, `[assistant]`, and `[unverified]` tags, without a permalink API call for every historical line.
 
 ### Channel context
 

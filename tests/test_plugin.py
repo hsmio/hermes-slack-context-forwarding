@@ -592,6 +592,228 @@ def test_incomplete_thread_is_labeled_and_inaccessible_source_fails_safe():
     assert "could not" in event.channel_context.lower()
 
 
+def _provenance_fixture(ts="1234567893.000004", root="", text="feedback"):
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    client = SimpleNamespace(retry_handlers=[object()], chat_getPermalink=AsyncMock(
+        side_effect=lambda channel, message_ts: {"ok": True, "permalink":
+            f"https://acme.slack.com/archives/{channel}/p{message_ts.replace('.', '')}"}))
+    event = MessageEvent(text=text, message_id=ts, raw_message={
+        "channel": "CHOME", "ts": ts, "thread_ts": root, "text": text},
+        metadata={"slack_team_id": "TWORK"}, channel_context="existing native context")
+    return adapter, client, event
+
+
+def _deliver_provenance(adapter, client, event):
+    with (patch.object(adapter, "_get_client", return_value=client) as select,
+          patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock) as parent):
+        asyncio.run(adapter.handle_message(event))
+    parent.assert_awaited_once_with(event)
+    return select
+
+
+def test_current_feedback_link_is_not_the_linked_source():
+    source = "https://acme.slack.com/archives/CHOME/p1234567890000001"
+    adapter, client, event = _provenance_fixture(text=f"Record this feedback; source {source}")
+    with patch.object(adapter, "_linked_thread_context", new_callable=AsyncMock, return_value="linked source"):
+        select = _deliver_provenance(adapter, client, event)
+    assert event.text == f"Record this feedback; source {source}"
+    assert event.channel_context.startswith("[Current Slack message provenance")
+    assert "Current message: channel=CHOME ts=1234567893.000004" in event.channel_context
+    assert "https://acme.slack.com/archives/CHOME/p1234567893000004" in event.channel_context
+    assert "actual feedback message" in event.channel_context
+    assert "linked/forwarded" in event.channel_context
+    assert "ask only" in event.channel_context
+    assert "existing native context" in event.channel_context
+    select.assert_called_with("CHOME", team_id="TWORK")
+    client.chat_getPermalink.assert_awaited_once_with(channel="CHOME", message_ts=event.message_id)
+    assert len(client.retry_handlers) == 1  # shared workspace client was not mutated
+
+
+def test_reply_and_later_turn_have_separate_current_and_root_links():
+    for ts in ("1234567893.000004", "1234567894.000005"):
+        adapter, client, event = _provenance_fixture(ts=ts, root="1234567890.000001")
+        _deliver_provenance(adapter, client, event)
+        assert f"Current message: channel=CHOME ts={ts}" in event.channel_context
+        assert "Thread root: channel=CHOME ts=1234567890.000001" in event.channel_context
+        assert f"/p{ts.replace('.', '')}" in event.channel_context
+        assert "/p1234567890000001" in event.channel_context
+        assert client.chat_getPermalink.await_count == 2
+
+
+def test_top_level_root_reuses_current_permalink():
+    adapter, client, event = _provenance_fixture(root="1234567893.000004")
+    _deliver_provenance(adapter, client, event)
+    assert "Thread root: channel=CHOME ts=1234567893.000004" in event.channel_context
+    client.chat_getPermalink.assert_awaited_once()
+
+
+def test_commands_and_synthetic_force_processing_are_untouched():
+    for command in (True, False):
+        adapter, client, event = _provenance_fixture(text="/reset")
+        event.raw_message["attachments"] = [{"is_share": True, "text": "quoted"}]
+        if command:
+            event.message_type = MessageType.COMMAND
+        else:
+            event.raw_message["_hermes_force_process"] = True
+        _deliver_provenance(adapter, client, event)
+        assert event.text == "/reset"
+        assert event.channel_context == "existing native context"
+        client.chat_getPermalink.assert_not_awaited()
+
+
+def test_permalink_failures_are_fail_open_and_safe_to_log():
+    for failure in (PermissionError("SECRET_TOKEN"), TimeoutError("SECRET_TOKEN")):
+        adapter, client, event = _provenance_fixture()
+        client.chat_getPermalink.side_effect = failure
+        with patch.object(PLUGIN.logger, "info") as log:
+            _deliver_provenance(adapter, client, event)
+        assert "permalink=unavailable" in event.channel_context
+        assert type(failure).__name__ in event.channel_context
+        assert "SECRET_TOKEN" not in event.channel_context
+        assert "SECRET_TOKEN" not in str(log.call_args_list)
+        client.chat_getPermalink.assert_awaited_once()
+
+
+def test_permalink_attempt_disables_sdk_retries_without_mutating_workspace_client():
+    adapter, _, event = _provenance_fixture()
+    attempts = []
+    class Client:
+        retry_handlers = [object()]
+        async def chat_getPermalink(self, **kwargs):
+            attempts.append((list(self.retry_handlers), kwargs))
+            raise ConnectionError("SECRET_TOKEN")
+    client = Client()
+    _deliver_provenance(adapter, client, event)
+    assert attempts == [([], {"channel": "CHOME", "message_ts": "1234567893.000004"})]
+    assert len(client.retry_handlers) == 1
+    assert event.channel_context.count("permalink=unavailable (ConnectionError)") == 2
+
+
+def test_permalink_timeout_is_bounded_without_retries():
+    adapter, client, event = _provenance_fixture()
+    async def hanging(**kwargs):
+        await asyncio.sleep(60)
+    client.chat_getPermalink.side_effect = hanging
+    with patch.object(PLUGIN, "_PERMALINK_TIMEOUT_SECONDS", 0.01):
+        _deliver_provenance(adapter, client, event)
+    assert "TimeoutError" in event.channel_context
+    client.chat_getPermalink.assert_awaited_once()
+
+
+def test_permalink_response_must_match_validated_channel_and_timestamp():
+    for response in (None, {"ok": False, "error": "SECRET"}, {"ok": True},
+                     {"ok": True, "permalink": "https://evil.example/archives/CHOME/p1234567893000004"},
+                     {"ok": True, "permalink": "https://acme.slack.com/archives/COTHER/p1234567893000004"},
+                     {"ok": True, "permalink": "https://acme.slack.com/archives/CHOME/p1234567890000001"}):
+        adapter, client, event = _provenance_fixture()
+        client.chat_getPermalink.side_effect = None
+        client.chat_getPermalink.return_value = response
+        _deliver_provenance(adapter, client, event)
+        assert "permalink=unavailable" in event.channel_context
+        assert "https://" not in event.channel_context
+        client.chat_getPermalink.assert_awaited_once()
+
+
+def test_invalid_inbound_identifiers_never_call_permalink_api():
+    for key, value in (("channel", "C_BAD"), ("ts", "not-a-ts"), ("thread_ts", "bad-root")):
+        adapter, client, event = _provenance_fixture()
+        event.raw_message[key] = value
+        _deliver_provenance(adapter, client, event)
+        assert "invalid" in event.channel_context.lower()
+        # Bad root does not prevent valid current-message provenance.
+        assert client.chat_getPermalink.await_count == (1 if key == "thread_ts" else 0)
+
+
+def test_metadata_fallback_selects_correct_workspace():
+    adapter, client, event = _provenance_fixture()
+    event.raw_message = {}
+    event.metadata.update(slack_channel_id="CHOME", slack_thread_ts="1234567890.000001")
+    select = _deliver_provenance(adapter, client, event)
+    assert "Thread root: channel=CHOME ts=1234567890.000001" in event.channel_context
+    assert all(call.args == ("CHOME",) and call.kwargs == {"team_id": "TWORK"}
+               for call in select.call_args_list)
+
+
+def test_native_thread_line_keeps_trust_tags_and_adds_validated_ids():
+    adapter, client, _ = _provenance_fixture()
+    adapter._bot_user_id = "UBOT"
+    with (patch.object(adapter, "_resolve_user_name", new_callable=AsyncMock, return_value="Alice"),
+          patch.object(adapter, "_is_sender_authorized", return_value=False)):
+        for msg, parent, tag in (({"user": "UHUMAN"}, True, "[thread parent] [unverified]"),
+                                 ({"user": "UBOT", "bot_id": "B1"}, False, "[assistant]")):
+            msg["ts"] = "1234567890.000001"
+            line = asyncio.run(adapter._thread_context_line(msg, "quoted", parent, "TWORK", "CHOME"))
+            assert line.startswith(tag)
+            assert "channel=CHOME ts=1234567890.000001" in line
+        line = asyncio.run(adapter._thread_context_line({"ts": "bad"}, "quoted", False, "TWORK", "CHOME"))
+        assert "ts=bad" not in line
+    client.chat_getPermalink.assert_not_awaited()
+
+
+def test_channel_history_keeps_trust_tags_and_validated_ids_without_permalink_calls():
+    adapter, client, _ = _provenance_fixture()
+    client.conversations_history = AsyncMock(return_value={"messages": [
+        {"ts": "1234567890.000001", "user": "UHUMAN", "text": "historic"}]})
+    with (patch.object(adapter, "_get_client", return_value=client),
+          patch.object(adapter, "_resolve_user_name", new_callable=AsyncMock, return_value="Alice"),
+          patch.object(adapter, "_is_sender_authorized", return_value=False)):
+        context = asyncio.run(adapter._fetch_channel_history_context(
+            channel_id="CHOME", current_ts="1234567893.000004", team_id="TWORK"))
+    assert "[unverified] Alice:" in context
+    assert "historic" in context
+    assert "channel=CHOME ts=1234567890.000001" in context
+    client.chat_getPermalink.assert_not_awaited()
+
+
+def test_oversized_channel_history_preserves_identity_before_truncated_body():
+    adapter, client, _ = _provenance_fixture()
+    identity = "[Slack message: channel=CHOME ts=1234567890.000001]"
+    client.conversations_history = AsyncMock(return_value={"messages": [
+        {"ts": "1234567890.000001", "user": "UHUMAN", "text": "x" * 13000}]})
+    with (patch.object(adapter, "_get_client", return_value=client),
+          patch.object(adapter, "_resolve_user_name", new_callable=AsyncMock, return_value="Alice"),
+          patch.object(adapter, "_is_sender_authorized", return_value=False)):
+        context = asyncio.run(adapter._fetch_channel_history_context(
+            channel_id="CHOME", current_ts="1234567893.000004", team_id="TWORK"))
+    assert len(context) == PLUGIN._CONTEXT_MAX_CHARS == 12000
+    assert context.startswith(PLUGIN._CONTEXT_HEADER + "\n[unverified] Alice:")
+    assert context.endswith("...\n" + PLUGIN._CONTEXT_FOOTER)
+    assert context.count(identity) == 1
+    assert context.index(identity) < context.index("x" * 100)
+    client.chat_getPermalink.assert_not_awaited()
+
+
+def test_near_budget_channel_history_keeps_all_retained_identities():
+    adapter, client, _ = _provenance_fixture()
+    timestamps = ("1234567892.000003", "1234567891.000002", "1234567890.000001")
+    identities = [f"[Slack message: channel=CHOME ts={ts}]" for ts in timestamps]
+    body_budget = (PLUGIN._CONTEXT_MAX_CHARS - len(PLUGIN._CONTEXT_HEADER)
+                   - len(PLUGIN._CONTEXT_FOOTER) - 2)
+    # Two complete records exactly fill the budget; the older third must be dropped.
+    prefix_chars = len("[unverified] Alice: ") + len(identities[0]) + 1
+    newest_body = "x" * 100
+    older_body = "y" * (body_budget - 2 * prefix_chars - len(newest_body) - 1)
+    client.conversations_history = AsyncMock(return_value={"messages": [
+        {"ts": ts, "user": "UHUMAN", "text": text}
+        for ts, text in zip(timestamps, (newest_body, older_body, "excluded oldest"))]})
+    with (patch.object(adapter, "_get_client", return_value=client),
+          patch.object(adapter, "_resolve_user_name", new_callable=AsyncMock, return_value="Alice"),
+          patch.object(adapter, "_is_sender_authorized", return_value=False)):
+        context = asyncio.run(adapter._fetch_channel_history_context(
+            channel_id="CHOME", current_ts="1234567893.000004", team_id="TWORK"))
+    assert len(context) == PLUGIN._CONTEXT_MAX_CHARS == 12000
+    lines = context[len(PLUGIN._CONTEXT_HEADER) + 1:-(len(PLUGIN._CONTEXT_FOOTER) + 1)].splitlines()
+    assert len(lines) == 2
+    for line, identity, body in zip(lines, reversed(identities[:2]), (older_body, newest_body)):
+        assert line.startswith("[unverified] Alice:")
+        assert line.count(identity) == 1
+        assert line.index(identity) < line.index(body)
+        assert line.endswith(body)
+    assert identities[2] not in context
+    assert "excluded oldest" not in context
+    client.chat_getPermalink.assert_not_awaited()
+
+
 if __name__ == "__main__":
     tests = [
         value
