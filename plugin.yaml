@@ -1,7 +1,7 @@
 name: slack-context-forwarding
 label: Slack Context & Forwarding
 kind: platform
-version: 0.3.0
+version: 0.3.1
 description: >
   Adds bounded top-level Slack channel context and reliable native forwarded
   message text/file handling and linked/forwarded source-thread reading to the bundled Slack adapter.

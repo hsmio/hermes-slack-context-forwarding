@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1 — Inbound message provenance
+
+- Prepend current message and distinct thread-root channel/timestamp/permalink provenance to `event.channel_context`, independently of linked/forwarded sources and without changing command text.
+- Obtain permalinks using the channel/team-selected workspace client with a two-second timeout per unique message, disabled retries, validated returned channel/timestamp, and fail-open status. Never synthesize a Slack URL or log raw exceptions.
+- Preserve native thread role/trust tags while appending validated historical message IDs; channel-history lines also retain validated IDs without per-line permalink API calls.
+- Skip commands and synthetic force-processing events. Add regressions for feedback source-link confusion, replies/later turns, workspace routing, missing/invalid IDs, malformed API results, errors, timeout, and historical trust tags.
+
 ## 0.3.0 — Linked and forwarded source threads
 
 - Resolve authored Slack message permalinks and native forwards with a usable source reference through the existing workspace-scoped bot client.
