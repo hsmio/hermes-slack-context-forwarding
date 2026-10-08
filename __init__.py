@@ -37,6 +37,9 @@ _FORWARDED_MAX_CHARS = 12_000
 _REFERENCE_MAX_CHARS = 18_000
 _REFERENCE_MAX_COUNT = 2
 _REFERENCE_MAX_MESSAGES = 200
+_ACCESS_TIMEOUT_SECONDS = 2.0
+_ACCESS_MAX_PAGES = 10
+_USER_RE = re.compile(r"[UW][A-Z0-9]+\Z")
 _REFERENCE_MAX_PAGES = 3
 _SLACK_URL_RE = re.compile(r"https?://[^\s<>|]+/archives/[A-Z0-9]+/p\d{16,18}[^\s<>|]*", re.IGNORECASE)
 _CHANNEL_RE = re.compile(r"[CDG][A-Z0-9]+\Z")
@@ -304,35 +307,94 @@ class SlackHistoryBackfillAdapter(bundled_slack.SlackAdapter):
             cursor = next_cursor
         return messages, more
 
+    async def _requester_source_access(self, ref: _Reference, team_id: str, requester: str) -> bool:
+        """Verify the current requester, never a quoted author or bot membership."""
+        if not isinstance(requester, str) or not _USER_RE.fullmatch(requester):
+            return False
+        try:
+            client = copy.copy(self._get_client(ref.channel, team_id=team_id or None))
+            client.retry_handlers = []
+            info = await asyncio.wait_for(
+                client.conversations_info(channel=ref.channel), timeout=_ACCESS_TIMEOUT_SECONDS)
+            source = info.get("channel") if hasattr(info, "get") else None
+            if (not hasattr(info, "get") or info.get("ok") is not True or not isinstance(source, dict)
+                    or source.get("id") != ref.channel):
+                return False
+            if any(key in source and not isinstance(source[key], bool)
+                   for key in ("is_channel", "is_im", "is_mpim", "is_group", "is_private")):
+                return False
+            is_channel = source.get("is_channel") is True
+            is_im = source.get("is_im") is True
+            is_mpim = source.get("is_mpim") is True
+            is_group = source.get("is_group") is True
+            if (not (is_channel or is_im or is_mpim or is_group)
+                    or (is_channel and (is_im or is_mpim)) or (is_im and (is_mpim or is_group))
+                    or ((is_channel or (is_group and not is_mpim))
+                        and not isinstance(source.get("is_private"), bool))):
+                return False
+            # Public nonmembers are readable only for verified ordinary internal users.
+            # Guests and Slack Connect/external users still need explicit membership.
+            public = (source.get("is_channel") is True and source.get("is_private") is False
+                      and source.get("is_im") is not True and source.get("is_mpim") is not True
+                      and source.get("is_group") is not True)
+            if public:
+                user_response = await asyncio.wait_for(
+                    client.users_info(user=requester), timeout=_ACCESS_TIMEOUT_SECONDS)
+                user = user_response.get("user") if hasattr(user_response, "get") else None
+                if (not hasattr(user_response, "get") or user_response.get("ok") is not True
+                        or not isinstance(user, dict) or user.get("id") != requester):
+                    return False
+                if any(key in user and not isinstance(user[key], bool) for key in (
+                        "deleted", "is_bot", "is_app_user", "is_restricted", "is_ultra_restricted",
+                        "is_stranger", "is_invited_user")):
+                    return False
+                if user.get("deleted") is True or user.get("is_bot") is True or user.get("is_app_user") is True:
+                    return False
+                source_teams = [source[key] for key in ("context_team_id", "team_id") if source.get(key)]
+                if (team_id and source_teams and all(team == team_id for team in source_teams)
+                        and user.get("team_id") == team_id
+                        and user.get("is_stranger") is not True
+                        and user.get("is_invited_user") is not True
+                        and all(user.get(flag) is False for flag in (
+                            "deleted", "is_bot", "is_app_user", "is_restricted", "is_ultra_restricted"))):
+                    return True
+            cursor = ""
+            seen_cursors: set[str] = set()
+            for _ in range(_ACCESS_MAX_PAGES):
+                params = {"channel": ref.channel, "limit": 200}
+                if cursor:
+                    params["cursor"] = cursor
+                response = await asyncio.wait_for(
+                    client.conversations_members(**params), timeout=_ACCESS_TIMEOUT_SECONDS)
+                if (not hasattr(response, "get") or response.get("ok") is not True
+                        or not isinstance(response.get("members"), list)
+                        or not all(isinstance(member, str) and _USER_RE.fullmatch(member)
+                                   for member in response["members"])):
+                    return False
+                metadata = response.get("response_metadata", {})
+                if not isinstance(metadata, dict):
+                    return False
+                next_cursor = metadata.get("next_cursor", "")
+                if not isinstance(next_cursor, str) or len(next_cursor) > 2000:
+                    return False
+                if requester in response["members"]:
+                    return True
+                if not next_cursor or next_cursor in seen_cursors:
+                    return False
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+            return False
+        except Exception as exc:
+            logger.info("[Slack] Requester source access could not be verified: %s", type(exc).__name__)
+            return False
+
     async def _linked_thread_context(
-        self, ref: _Reference, *, team_id: str, destination_channel: str,
+        self, ref: _Reference, *, team_id: str, destination_channel: str, requester: str = "",
     ) -> str:
         label = f"{ref.channel}/{ref.target_ts}"
-        if ref.channel != destination_channel:
-            if ref.channel.startswith(("G", "D")):
-                return f"[Linked Slack message {label}: private cross-channel source not fetched.]"
-            try:
-                client = self._get_client(ref.channel, team_id=team_id or None)
-                destination_info = await self._get_client(
-                    destination_channel, team_id=team_id or None).conversations_info(
-                        channel=destination_channel)
-                dest = destination_info.get("channel") or {}
-                if (destination_info.get("ok") is False
-                        or dest.get("id") != destination_channel
-                        or dest.get("is_channel") is not True
-                        or dest.get("is_shared") is not False
-                        or dest.get("is_ext_shared") is not False):
-                    return f"[Linked Slack message {label}: destination is shared or unverified; not fetched.]"
-                info = await client.conversations_info(
-                    channel=ref.channel)
-                source = info.get("channel") or {}
-                if (info.get("ok") is False or source.get("id") != ref.channel
-                        or source.get("is_private") is not False
-                        or source.get("is_channel") is not True):
-                    return f"[Linked Slack message {label}: source is not verified public; not fetched.]"
-            except Exception as exc:
-                logger.info("[Slack] Source privacy could not be verified: %s", type(exc).__name__)
-                return f"[Linked Slack message {label}: source privacy could not be verified; not fetched.]"
+        # Same-conversation references rely on the bundled inbound authorization/routing gate.
+        if ref.channel != destination_channel and not await self._requester_source_access(ref, team_id, requester):
+            return f"[Linked Slack message {label}: requester source access could not be verified; not fetched.]"
         try:
             messages, more = await self._source_thread(ref, team_id)
         except Exception as exc:
@@ -586,6 +648,13 @@ class SlackHistoryBackfillAdapter(bundled_slack.SlackAdapter):
                 )
 
         if event.message_type != MessageType.COMMAND and not raw.get("_hermes_force_process"):
+            # Only transport identity from the accepted current event is authoritative.
+            # A quoted forward/root author must never grant access for a later requester.
+            source_user = getattr(event.source, "user_id", "")
+            raw_user = raw.get("user", "")
+            requester = source_user or raw_user
+            if source_user and raw_user and source_user != raw_user:
+                requester = ""
             references = _message_references(raw)
             references.extend(await self._parent_references(raw, team_id, bot_uid))
             seen: set[tuple[str, str]] = set()
@@ -599,6 +668,7 @@ class SlackHistoryBackfillAdapter(bundled_slack.SlackAdapter):
                     break
                 contexts.append(await self._linked_thread_context(
                     ref, team_id=team_id,
+                    requester=requester,
                     destination_channel=str(raw.get("channel") or event.metadata.get("slack_channel_id") or ""),
                 ))
             if contexts:

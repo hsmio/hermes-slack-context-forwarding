@@ -130,7 +130,7 @@ def test_combined_forwarded_context_has_a_single_aggregate_bound():
     event = MessageEvent(text="question", raw_message={"attachments": [
         {"is_share": True, "author_id": "U_OTHER", "text": "x" * 9000},
         {"is_share": True, "author_id": "U_OTHER", "text": "y" * 9000},
-    ]}, metadata={"slack_team_id": "T_TEST"})
+    ]}, source=SimpleNamespace(user_id="UREQUESTER"), metadata={"slack_team_id": "T_TEST"})
     with patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock):
         asyncio.run(adapter.handle_message(event))
     assert len(event.text) <= PLUGIN._FORWARDED_MAX_CHARS + len("question\n\n")
@@ -202,7 +202,7 @@ def test_forwarded_text_and_file_provenance_in_message_event():
         "is_share": True, "is_msg_unfurl": True, "author_id": "U_OTHER",
         "text": "note", "files": [{"id": "F1", "name": "report.pdf", "mimetype": "application/pdf"}],
     }]}
-    event = MessageEvent(text="What is attached?", raw_message=raw, metadata={"slack_team_id": "T_TEST"})
+    event = MessageEvent(text="What is attached?", raw_message=raw, source=SimpleNamespace(user_id="UREQUESTER"), metadata={"slack_team_id": "T_TEST"})
     with patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock) as parent:
         asyncio.run(adapter.handle_message(event))
     parent.assert_awaited_once()
@@ -246,7 +246,7 @@ def test_history_does_not_fetch_for_thread_reply_or_command():
             text="hello", message_type=message_type, raw_message={
                 "channel": "C_TEST", "ts": "2", "thread_ts": thread_ts,
                 "text": "<@U_BOT> hello",
-            }, metadata={"slack_team_id": "T_TEST"},
+            }, source=SimpleNamespace(user_id="UREQUESTER"), metadata={"slack_team_id": "T_TEST"},
         )
         assert not adapter._eligible_for_history_backfill(event)
 
@@ -258,6 +258,8 @@ def test_linked_reply_fetches_thread_and_marks_exact_target():
     client.conversations_info = AsyncMock(side_effect=lambda channel: {
         "ok": True, "channel": {"id": channel, "is_private": False, "is_channel": True,
                                 "is_shared": False, "is_ext_shared": False}})
+    client.conversations_members = AsyncMock(return_value={"ok": True, "members": ["UREQUESTER"]})
+    client.users_info = _access_client().users_info
     client.conversations_replies = AsyncMock(side_effect=[
         {"messages": [
             {"ts": "1234567890.000001", "user": "U_A", "text": "Root"},
@@ -270,7 +272,7 @@ def test_linked_reply_fetches_thread_and_marks_exact_target():
     raw = {"channel": "C_HOME", "ts": "1234567893.000004", "text":
            "Look <https://acme.slack.com/archives/CSOURCE/p1234567892000003?thread_ts=1234567890.000001&cid=CSOURCE|here>"}
     event = MessageEvent(text=raw["text"], raw_message=raw,
-                         metadata={"slack_team_id": "T_TEST"})
+                         source=SimpleNamespace(user_id="UREQUESTER"), metadata={"slack_team_id": "T_TEST"})
     with (
         patch.object(adapter, "_get_client", return_value=client),
         patch.object(adapter, "_resolve_user_name", new_callable=AsyncMock, side_effect=lambda user, **kw: user),
@@ -292,6 +294,8 @@ def test_later_mention_resolves_link_on_current_thread_root():
     client.conversations_info = AsyncMock(side_effect=lambda channel: {
         "ok": True, "channel": {"id": channel, "is_private": False, "is_channel": True,
                                 "is_shared": False, "is_ext_shared": False}})
+    client.conversations_members = AsyncMock(return_value={"ok": True, "members": ["UREQUESTER"]})
+    client.users_info = _access_client().users_info
     client.conversations_replies = AsyncMock(side_effect=[
         {"messages": [{"ts": "1234567890.000001", "text":
             "See https://acme.slack.com/archives/CSOURCE/p1234567892000003"}]},
@@ -302,7 +306,7 @@ def test_later_mention_resolves_link_on_current_thread_root():
     event = MessageEvent(text="What do you think?", raw_message={
         "channel": "C_HOME", "ts": "1234567894.000005",
         "thread_ts": "1234567890.000001", "text": "<@U_BOT> What do you think?",
-    }, metadata={"slack_team_id": "T_TEST"})
+    }, source=SimpleNamespace(user_id="UREQUESTER"), metadata={"slack_team_id": "T_TEST"})
     with (
         patch.object(adapter, "_get_client", return_value=client),
         patch.object(adapter, "_resolve_user_name", new_callable=AsyncMock, return_value="Alice"),
@@ -365,71 +369,59 @@ def test_no_thread_reference_following_in_fetched_content():
     client.conversations_info = AsyncMock(side_effect=lambda channel: {
         "ok": True, "channel": {"id": channel, "is_private": False, "is_channel": True,
                                 "is_shared": False, "is_ext_shared": False}})
+    client.conversations_members = AsyncMock(return_value={"ok": True, "members": ["UREQUESTER"]})
+    client.users_info = _access_client().users_info
     client.conversations_replies = AsyncMock(return_value={"messages": [{
         "ts": "1234567892.000003", "text":
         "https://acme.slack.com/archives/COTHER/p1234567894000005",
     }], "has_more": False})
     event = MessageEvent(text="link", raw_message={"channel": "CHOME", "ts": "1234567893.000004",
         "text": "https://acme.slack.com/archives/CSOURCE/p1234567892000003"},
-        metadata={"slack_team_id": "T_TEST"})
+        source=SimpleNamespace(user_id="UREQUESTER"), metadata={"slack_team_id": "T_TEST"})
     with (patch.object(adapter, "_get_client", return_value=client),
           patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock)):
         asyncio.run(adapter.handle_message(event))
     client.conversations_replies.assert_awaited_once()
 
 
-def test_cross_channel_private_reference_never_calls_slack():
+def test_cross_channel_private_nonmember_never_reads_source():
     adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
-    adapter._bot_user_id = "U_BOT"
-    event = MessageEvent(text="see link", raw_message={"channel": "C_HOME", "ts": "1234567893.000004",
-        "text": "https://acme.slack.com/archives/GSECRET/p1234567892000003"},
-        metadata={"slack_team_id": "T_TEST"})
-    with (
-        patch.object(adapter, "_get_client", side_effect=AssertionError("private lookup")),
-        patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock),
-    ):
-        asyncio.run(adapter.handle_message(event))
-    assert "private" in event.channel_context.lower()
-
-
-def test_private_c_prefixed_slack_connect_source_fails_closed():
-    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
-    adapter._bot_user_id = "U_BOT"
-    client = SimpleNamespace(
-        conversations_info=AsyncMock(side_effect=lambda channel: {
-            "ok": True, "channel": {"id": channel, "is_channel": True,
-                                    "is_private": channel == "CSOURCE",
-                                    "is_shared": False, "is_ext_shared": False}}),
-        conversations_replies=AsyncMock(side_effect=AssertionError("private read")),
-    )
-    event = MessageEvent(text="link", raw_message={"channel": "CHOME", "ts": "1234567893.000004",
-        "text": "https://acme.slack.com/archives/CSOURCE/p1234567892000003"},
-        metadata={"slack_team_id": "T_TEST"})
-    with (patch.object(adapter, "_get_client", return_value=client),
-          patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock)):
-        asyncio.run(adapter.handle_message(event))
-    assert client.conversations_info.await_count == 2
+    client = _access_client("GSECRET")
+    client.conversations_members.return_value = {"ok": True, "members": ["UBOT", "UAUTHOR"]}
+    with patch.object(adapter, "_get_client", return_value=client):
+        context = asyncio.run(adapter._linked_thread_context(
+            PLUGIN._Reference("GSECRET", "1234567892.000003"),
+            team_id="T_TEST", destination_channel="DHOME", requester="UREQUESTER"))
+    assert "not fetched" in context
     client.conversations_replies.assert_not_awaited()
-    assert "not verified public" in event.channel_context
+    client.conversations_info.assert_awaited_once_with(channel="GSECRET")
 
 
-def test_public_source_is_not_quoted_into_slack_connect_destination():
+def test_private_c_prefixed_slack_connect_member_can_share_source():
     adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
-    client = SimpleNamespace(conversations_info=AsyncMock(return_value={
-        "ok": True, "channel": {"id": "CHOME", "is_channel": True,
-                                "is_shared": True, "is_ext_shared": True}}),
-        conversations_replies=AsyncMock(side_effect=AssertionError("shared destination read")))
-    context = asyncio.run(_context_with_client(adapter, client))
-    assert "destination is shared or unverified" in context
-    client.conversations_replies.assert_not_awaited()
+    client = _access_client(is_shared=True, is_ext_shared=True)
+    assert "Verified source" in asyncio.run(_context_with_client(adapter, client))
+    client.conversations_info.assert_awaited_once_with(channel="CSOURCE")
+    client.conversations_members.assert_awaited_once()
+
+
+def test_public_source_can_be_shared_into_slack_connect_destination_without_lookup():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    client = _access_client(is_private=False, context_team_id="T_TEST")
+    # CHOME may be shared, private, or an IM: destination metadata is never consulted.
+    assert "Verified source" in asyncio.run(_context_with_client(adapter, client))
+    client.conversations_info.assert_awaited_once_with(channel="CSOURCE")
+    client.conversations_members.assert_not_awaited()
 
 
 def test_missing_conversation_info_scope_fails_closed():
     adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
-    client = SimpleNamespace(conversations_info=AsyncMock(side_effect=PermissionError("missing_scope")),
-                             conversations_replies=AsyncMock(side_effect=AssertionError("read")))
-    context = asyncio.run(_context_with_client(adapter, client))
-    assert "privacy could not be verified" in context
+    client = _access_client()
+    client.conversations_info.side_effect = PermissionError("missing_scope SECRET")
+    with patch.object(PLUGIN.logger, "info") as log:
+        context = asyncio.run(_context_with_client(adapter, client))
+    assert "access could not be verified" in context
+    assert "SECRET" not in str(log.call_args_list) + context
     client.conversations_replies.assert_not_awaited()
 
 
@@ -437,7 +429,7 @@ async def _context_with_client(adapter, client):
     with patch.object(adapter, "_get_client", return_value=client):
         return await adapter._linked_thread_context(
             PLUGIN._Reference("CSOURCE", "1234567892.000003"),
-            team_id="T_TEST", destination_channel="CHOME")
+            team_id="T_TEST", destination_channel="CHOME", requester="UREQUESTER")
 
 
 def test_reply_after_message_cap_is_verified_with_targeted_lookup():
@@ -447,6 +439,8 @@ def test_reply_after_message_cap_is_verified_with_targeted_lookup():
         conversations_info=AsyncMock(side_effect=lambda channel: {
             "ok": True, "channel": {"id": channel, "is_channel": True, "is_private": False,
                                     "is_shared": False, "is_ext_shared": False}}),
+        conversations_members=AsyncMock(return_value={"ok": True, "members": ["UREQUESTER"]}),
+        users_info=_access_client().users_info,
         conversations_replies=AsyncMock(side_effect=[
             {"messages": [
                 {"ts": "1234567890.000001", "text": "Root"},
@@ -459,7 +453,7 @@ def test_reply_after_message_cap_is_verified_with_targeted_lookup():
     with (patch.object(adapter, "_get_client", return_value=client),):
         context = asyncio.run(adapter._linked_thread_context(
             PLUGIN._Reference("CSOURCE", "1234567899.000009", "1234567890.000001"),
-            team_id="T_TEST", destination_channel="CHOME"))
+            team_id="T_TEST", destination_channel="CHOME", requester="UREQUESTER"))
     assert "SHARED MESSAGE" in context and "Later shared reply" in context
     assert "TRUNCATED" in context
     assert client.conversations_replies.await_args_list[1].kwargs["oldest"] == "1234567899.000009"
@@ -497,12 +491,14 @@ def test_later_mention_uses_native_thread_cache_without_extra_root_fetch():
         conversations_info=AsyncMock(side_effect=lambda channel: {
             "ok": True, "channel": {"id": channel, "is_channel": True, "is_private": False,
                                     "is_shared": False, "is_ext_shared": False}}),
+        conversations_members=AsyncMock(return_value={"ok": True, "members": ["UREQUESTER"]}),
+        users_info=_access_client().users_info,
         conversations_replies=AsyncMock(return_value={"messages": [
             {"ts": "1234567892.000003", "text": "Shared source"}]}),
     )
     event = MessageEvent(text="read", raw_message={"channel": "CHOME",
         "ts": "1234567894.000005", "thread_ts": "1234567890.000001",
-        "text": "<@U_BOT> read"}, metadata={"slack_team_id": "T_TEST"})
+        "text": "<@U_BOT> read"}, source=SimpleNamespace(user_id="UREQUESTER"), metadata={"slack_team_id": "T_TEST"})
     with (patch.object(adapter, "_get_client", return_value=client),
           patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock)):
         asyncio.run(adapter.handle_message(event))
@@ -524,12 +520,14 @@ def test_later_mention_resolves_native_forward_on_root():
         conversations_info=AsyncMock(side_effect=lambda channel: {
             "ok": True, "channel": {"id": channel, "is_channel": True, "is_private": False,
                                     "is_shared": False, "is_ext_shared": False}}),
+        conversations_members=AsyncMock(return_value={"ok": True, "members": ["UREQUESTER"]}),
+        users_info=_access_client().users_info,
         conversations_replies=AsyncMock(return_value={"messages": [
             {"ts": "1234567892.000003", "text": "Forward's source thread"}]}),
     )
     event = MessageEvent(text="read", raw_message={"channel": "CHOME",
         "ts": "1234567894.000005", "thread_ts": "1234567890.000001",
-        "text": "<@U_BOT> read"}, metadata={"slack_team_id": "T_TEST"})
+        "text": "<@U_BOT> read"}, source=SimpleNamespace(user_id="UREQUESTER"), metadata={"slack_team_id": "T_TEST"})
     with (patch.object(adapter, "_get_client", return_value=client),
           patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock)):
         asyncio.run(adapter.handle_message(event))
@@ -548,12 +546,14 @@ def test_root_audio_is_not_downloaded_when_inspecting_its_link():
         conversations_info=AsyncMock(side_effect=lambda channel: {
             "ok": True, "channel": {"id": channel, "is_channel": True, "is_private": False,
                                     "is_shared": False, "is_ext_shared": False}}),
+        conversations_members=AsyncMock(return_value={"ok": True, "members": ["UREQUESTER"]}),
+        users_info=_access_client().users_info,
         conversations_replies=AsyncMock(return_value={"messages": [
             {"ts": "1234567892.000003", "text": "Source text"}]}),
     )
     event = MessageEvent(text="read", raw_message={"channel": "CHOME",
         "ts": "1234567894.000005", "thread_ts": "1234567890.000001",
-        "text": "<@U_BOT> read"}, metadata={"slack_team_id": "T_TEST"})
+        "text": "<@U_BOT> read"}, source=SimpleNamespace(user_id="UREQUESTER"), metadata={"slack_team_id": "T_TEST"})
     with (patch.object(adapter, "_get_client", return_value=client),
           patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as download,
           patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock)):
@@ -571,19 +571,23 @@ def test_incomplete_thread_is_labeled_and_inaccessible_source_fails_safe():
     client.conversations_info = AsyncMock(side_effect=lambda channel: {
         "ok": True, "channel": {"id": channel, "is_private": False, "is_channel": True,
                                 "is_shared": False, "is_ext_shared": False}})
+    client.conversations_members = AsyncMock(return_value={"ok": True, "members": ["UREQUESTER"]})
+    client.users_info = _access_client().users_info
     client.conversations_replies = AsyncMock(return_value={"messages": [
         {"ts": "1234567890.000001", "text": "Root"},
         {"ts": "1234567891.000002", "text": "First"},
     ], "has_more": True, "response_metadata": {"next_cursor": "more"}})
     event = MessageEvent(text="read", raw_message={"channel": "C_HOME", "ts": "1234567893.000004",
         "text": "https://acme.slack.com/archives/CSOURCE/p1234567891000002?thread_ts=1234567890.000001"},
-        metadata={"slack_team_id": "T_TEST"})
+        source=SimpleNamespace(user_id="UREQUESTER"), metadata={"slack_team_id": "T_TEST"})
     with (patch.object(adapter, "_get_client", return_value=client),
           patch.object(adapter, "_resolve_user_name", new_callable=AsyncMock, return_value="Alice"),
           patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock)):
         asyncio.run(adapter.handle_message(event))
     assert "TRUNCATED" in event.channel_context
     assert "SHARED MESSAGE" in event.channel_context
+    client.conversations_members = AsyncMock(return_value={"ok": True, "members": ["UREQUESTER"]})
+    client.users_info = _access_client().users_info
     client.conversations_replies = AsyncMock(side_effect=PermissionError("no access"))
     event.channel_context = None
     with (patch.object(adapter, "_get_client", return_value=client),
@@ -812,6 +816,392 @@ def test_near_budget_channel_history_keeps_all_retained_identities():
     assert identities[2] not in context
     assert "excluded oldest" not in context
     client.chat_getPermalink.assert_not_awaited()
+
+
+def test_requester_can_share_private_source_into_dm():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    client = SimpleNamespace(
+        conversations_info=AsyncMock(return_value={"ok": True, "channel": {
+            "id": "GSECRET", "is_channel": True, "is_private": True}}),
+        conversations_members=AsyncMock(return_value={"ok": True, "members": ["UREQUESTER"]}),
+        conversations_replies=AsyncMock(return_value={"messages": [{
+            "ts": "1234567892.000003", "text": "Private source thread"}]}),
+    )
+    event = MessageEvent(text="read this",
+        raw_message={"channel": "DHOME", "user": "UREQUESTER", "ts": "1234567893.000004",
+            "text": "https://acme.slack.com/archives/GSECRET/p1234567892000003"},
+        source=SimpleNamespace(user_id="UREQUESTER"), metadata={"slack_team_id": "T_TEST"})
+    with (patch.object(adapter, "_get_client", return_value=client),
+          patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock)):
+        asyncio.run(adapter.handle_message(event))
+    assert "Private source thread" in event.channel_context
+    client.conversations_info.assert_awaited_once_with(channel="GSECRET")
+    client.conversations_members.assert_awaited_once_with(channel="GSECRET", limit=200)
+
+
+def _access_client(channel="CSOURCE", **source_fields):
+    source = {"id": channel, "is_channel": True, "is_private": True}
+    source.update(source_fields)
+    return SimpleNamespace(
+        retry_handlers=[object()],
+        conversations_info=AsyncMock(return_value={"ok": True, "channel": source}),
+        conversations_members=AsyncMock(return_value={"ok": True, "members": ["UREQUESTER"]}),
+        users_info=AsyncMock(return_value={"ok": True, "user": {
+            "id": "UREQUESTER", "team_id": "T_TEST", "deleted": False, "is_bot": False,
+            "is_app_user": False, "is_restricted": False, "is_ultra_restricted": False}}),
+        conversations_replies=AsyncMock(return_value={"messages": [{
+            "ts": "1234567892.000003", "text": "Verified source"}]}),
+    )
+
+
+def test_requester_membership_continues_paginated_results():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    client = _access_client()
+    client.conversations_members.side_effect = [
+        {"ok": True, "members": ["UOTHER"], "response_metadata": {"next_cursor": "second"}},
+        {"ok": True, "members": ["UREQUESTER"], "response_metadata": {"next_cursor": ""}},
+    ]
+    assert "Verified source" in asyncio.run(_context_with_client(adapter, client))
+    assert client.conversations_members.await_args_list[1].kwargs == {
+        "channel": "CSOURCE", "limit": 200, "cursor": "second"}
+
+
+def test_active_internal_nonmember_can_access_verified_public_source():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    client = _access_client(is_private=False, context_team_id="T_TEST")
+    client.conversations_members.return_value = {"ok": True, "members": []}
+    assert "Verified source" in asyncio.run(_context_with_client(adapter, client))
+    client.users_info.assert_awaited_once_with(user="UREQUESTER")
+    client.conversations_members.assert_not_awaited()
+
+
+def test_conflicting_transport_requester_fails_closed():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    client = _access_client()
+    event = MessageEvent(text="read", source=SimpleNamespace(user_id="UREQUESTER"),
+        raw_message={"channel": "DHOME", "user": "UOTHER", "ts": "1234567893.000004",
+            "text": "https://acme.slack.com/archives/CSOURCE/p1234567892000003"},
+        metadata={"slack_team_id": "T_TEST"})
+    with (patch.object(adapter, "_get_client", return_value=client),
+          patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock)):
+        asyncio.run(adapter.handle_message(event))
+    assert "not fetched" in event.channel_context
+    client.conversations_info.assert_not_awaited()
+    client.conversations_replies.assert_not_awaited()
+
+
+def test_source_type_and_privacy_metadata_must_be_valid_before_membership():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for source in ({"id": "CSOURCE", "is_channel": True},
+                   {"id": "CSOURCE", "is_channel": True, "is_private": "false"},
+                   {"id": "CSOURCE", "is_channel": True, "is_im": True, "is_private": False}):
+        client = _access_client()
+        client.conversations_info.return_value = {"ok": True, "channel": source}
+        assert "not fetched" in asyncio.run(_context_with_client(adapter, client))
+        client.conversations_members.assert_not_awaited()
+        client.conversations_replies.assert_not_awaited()
+
+
+def test_public_external_or_pending_user_needs_membership_even_with_matching_team():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for flag in ("is_stranger", "is_invited_user"):
+        client = _access_client(is_private=False, context_team_id="T_TEST")
+        client.users_info.return_value["user"][flag] = True
+        client.conversations_members.return_value = {"ok": True, "members": []}
+        assert "not fetched" in asyncio.run(_context_with_client(adapter, client))
+        client.conversations_replies.assert_not_awaited()
+
+
+def test_membership_cursor_cycles_and_page_cap_fail_closed():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for cursors, expected in ((["loop", "loop"], 2), (["a", "b", "a"], 3),
+                              ([f"page{i}" for i in range(PLUGIN._ACCESS_MAX_PAGES + 1)],
+                               PLUGIN._ACCESS_MAX_PAGES)):
+        client = _access_client()
+        client.conversations_members.side_effect = [
+            {"ok": True, "members": [], "response_metadata": {"next_cursor": cursor}}
+            for cursor in cursors]
+        assert "not fetched" in asyncio.run(_context_with_client(adapter, client))
+        assert client.conversations_members.await_count == expected
+        client.conversations_replies.assert_not_awaited()
+
+
+def test_invalid_membership_responses_fail_closed_before_thread_read():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for response in (None, {}, {"ok": False, "members": ["UREQUESTER"]},
+                     {"ok": True, "members": "UREQUESTER"},
+                     {"ok": True, "members": ["UREQUESTER", None]},
+                     {"ok": True, "members": ["UREQUESTER"], "response_metadata": []},
+                     {"ok": True, "members": ["UREQUESTER"], "response_metadata": {"next_cursor": 9}}):
+        client = _access_client()
+        client.conversations_members.return_value = response
+        assert "not fetched" in asyncio.run(_context_with_client(adapter, client))
+        client.conversations_replies.assert_not_awaited()
+
+
+def test_public_guests_and_external_users_require_membership():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for changes in ({"is_restricted": True}, {"is_ultra_restricted": True},
+                    {"team_id": "TOTHER"}):
+        for member in (False, True):
+            client = _access_client(is_private=False, context_team_id="T_TEST")
+            client.users_info.return_value["user"].update(changes)
+            client.conversations_members.return_value = {
+                "ok": True, "members": ["UREQUESTER"] if member else []}
+            context = asyncio.run(_context_with_client(adapter, client))
+            assert ("Verified source" in context) is member
+            assert client.conversations_replies.await_count == int(member)
+            client.conversations_members.assert_awaited_once()
+
+
+def test_public_missing_workspace_or_account_flags_requires_membership():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for missing in ("context_team_id", "team_id", "is_restricted", "is_bot", "deleted"):
+        for member in (False, True):
+            client = _access_client(is_private=False, context_team_id="T_TEST")
+            target = (client.conversations_info.return_value["channel"] if missing == "context_team_id"
+                      else client.users_info.return_value["user"])
+            target.pop(missing)
+            client.conversations_members.return_value = {
+                "ok": True, "members": ["UREQUESTER"] if member else []}
+            context = asyncio.run(_context_with_client(adapter, client))
+            assert ("Verified source" in context) is member
+            client.conversations_members.assert_awaited_once()
+
+
+def test_public_deleted_and_bot_identity_never_grants_access():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for flag in ("deleted", "is_bot", "is_app_user"):
+        client = _access_client(is_private=False, context_team_id="T_TEST")
+        client.users_info.return_value["user"][flag] = True
+        assert "not fetched" in asyncio.run(_context_with_client(adapter, client))
+        client.conversations_members.assert_not_awaited()
+        client.conversations_replies.assert_not_awaited()
+
+
+def test_invalid_user_lookup_fails_closed_without_membership_fallback():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for response in (None, {}, {"ok": False}, {"ok": True, "user": []},
+                     {"ok": True, "user": {"id": "UOTHER"}}):
+        client = _access_client(is_private=False, context_team_id="T_TEST")
+        client.users_info.return_value = response
+        assert "not fetched" in asyncio.run(_context_with_client(adapter, client))
+        client.conversations_members.assert_not_awaited()
+        client.conversations_replies.assert_not_awaited()
+
+
+def test_missing_or_invalid_requester_never_looks_up_source():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for requester in ("", None, "U_BAD", "urequester", " UREQUESTER", "UAUTHOR\n", {"id": "UREQUESTER"}):
+        client = _access_client()
+        with patch.object(adapter, "_get_client", return_value=client):
+            context = asyncio.run(adapter._linked_thread_context(
+                PLUGIN._Reference("CSOURCE", "1234567892.000003"),
+                team_id="T_TEST", destination_channel="DHOME", requester=requester))
+        assert "not fetched" in context
+        client.conversations_info.assert_not_awaited()
+        client.conversations_replies.assert_not_awaited()
+
+
+def test_source_metadata_identity_and_api_ok_are_required():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for response in (None, {}, {"ok": False}, {"ok": True}, {"ok": True, "channel": []},
+                     {"ok": True, "channel": {"id": "COTHER", "is_channel": True, "is_private": True}},
+                     {"ok": True, "channel": {"id": "CSOURCE"}}):
+        client = _access_client()
+        client.conversations_info.return_value = response
+        assert "not fetched" in asyncio.run(_context_with_client(adapter, client))
+        client.conversations_members.assert_not_awaited()
+        client.conversations_replies.assert_not_awaited()
+
+
+def test_dm_mpim_and_legacy_private_group_members_can_share_anywhere():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for source in ({"id": "DSOURCE", "is_im": True},
+                   {"id": "GSOURCE", "is_mpim": True, "is_group": True},
+                   {"id": "GSOURCE", "is_group": True, "is_private": True}):
+        for member in (False, True):
+            for destination in ("DHOME", "GSHARED", "CSHARED"):
+                client = _access_client()
+                client.conversations_info.return_value = {"ok": True, "channel": source}
+                client.conversations_members.return_value = {
+                    "ok": True, "members": ["UREQUESTER"] if member else ["UBOT"]}
+                with patch.object(adapter, "_get_client", return_value=client):
+                    context = asyncio.run(adapter._linked_thread_context(
+                        PLUGIN._Reference(source["id"], "1234567892.000003"),
+                        team_id="T_TEST", destination_channel=destination, requester="UREQUESTER"))
+                assert ("Verified source" in context) is member
+                client.conversations_info.assert_awaited_once_with(channel=source["id"])
+                client.users_info.assert_not_awaited()
+
+
+def test_same_conversation_relies_on_accepted_inbound_access():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    client = _access_client()
+    with patch.object(adapter, "_get_client", return_value=client):
+        context = asyncio.run(adapter._linked_thread_context(
+            PLUGIN._Reference("CSOURCE", "1234567892.000003"),
+            team_id="T_TEST", destination_channel="CSOURCE"))
+    assert "Verified source" in context
+    client.conversations_info.assert_not_awaited()
+    client.conversations_members.assert_not_awaited()
+    client.users_info.assert_not_awaited()
+
+
+def test_access_api_errors_do_not_log_response_secrets_or_read_thread():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for method in ("conversations_info", "conversations_members", "users_info"):
+        client = _access_client(is_private=(method != "users_info"), context_team_id="T_TEST")
+        getattr(client, method).side_effect = PermissionError("missing_scope SECRET_TOKEN")
+        with patch.object(PLUGIN.logger, "info") as log:
+            context = asyncio.run(_context_with_client(adapter, client))
+        assert "not fetched" in context
+        assert "SECRET_TOKEN" not in context + str(log.call_args_list)
+        client.conversations_replies.assert_not_awaited()
+
+
+def test_each_access_api_attempt_has_timeout():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    async def hanging(**kwargs):
+        await asyncio.sleep(60)
+    for method in ("conversations_info", "conversations_members", "users_info"):
+        client = _access_client(is_private=(method != "users_info"), context_team_id="T_TEST")
+        getattr(client, method).side_effect = hanging
+        with patch.object(PLUGIN, "_ACCESS_TIMEOUT_SECONDS", 0.01):
+            context = asyncio.run(_context_with_client(adapter, client))
+        assert "not fetched" in context
+        client.conversations_replies.assert_not_awaited()
+
+
+def test_current_requester_not_root_or_forward_author_grants_source_access():
+    for delayed in (False, True):
+        for member in (False, True):
+            adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+            adapter._bot_user_id = "UBOT"
+            client = _access_client()
+            client.conversations_members.return_value = {
+                "ok": True, "members": ["UAUTHOR", "UROOT"] + (["UREQUESTER"] if member else [])}
+            root = {"user": "UROOT", "ts": "1234567890.000001", "attachments": [{
+                "is_share": True, "author_id": "UAUTHOR", "text": "quote",
+                "channel_id": "CSOURCE", "message_ts": "1234567892.000003"}]}
+            raw = {"channel": "DHOME", "user": "UREQUESTER", "ts": "1234567893.000004",
+                   "text": "<@UBOT> read"}
+            if delayed:
+                raw["thread_ts"] = root["ts"]
+                key = adapter._thread_cache_key("DHOME", root["ts"], "T_TEST")
+                adapter._thread_context_cache[key] = SimpleNamespace(messages=[root])
+            else:
+                raw["attachments"] = root["attachments"]
+            event = MessageEvent(text="read", source=SimpleNamespace(user_id="UREQUESTER"),
+                                 raw_message=raw, metadata={"slack_team_id": "T_TEST"})
+            with (patch.object(adapter, "_get_client", return_value=client),
+                  patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock)):
+                asyncio.run(adapter.handle_message(event))
+            assert ("Verified source" in event.channel_context) is member
+            assert client.conversations_replies.await_count == int(member)
+
+
+def test_authenticated_raw_current_user_fallback_and_missing_identity():
+    for user in ("UREQUESTER", ""):
+        adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+        client = _access_client()
+        event = MessageEvent(text="read", raw_message={"channel": "DHOME", "user": user,
+            "ts": "1234567893.000004", "text": "https://acme.slack.com/archives/CSOURCE/p1234567892000003",
+            "attachments": [{"is_share": True, "author_id": "UREQUESTER", "text": "quote"}]},
+            metadata={"slack_team_id": "T_TEST"})
+        with (patch.object(adapter, "_get_client", return_value=client),
+              patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock)):
+            asyncio.run(adapter.handle_message(event))
+        assert ("Verified source" in event.channel_context) is bool(user)
+        assert client.conversations_replies.await_count == int(bool(user))
+
+
+def test_auth_and_source_read_use_inbound_workspace_not_primary_or_channel_mapping():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    client = _access_client()
+    primary = _access_client()
+    adapter._team_clients = {"T_TEST": client, "TOTHER": primary}
+    adapter._channel_team = {"CSOURCE": "TOTHER"}
+    adapter._app = SimpleNamespace(client=primary)
+    context = asyncio.run(adapter._linked_thread_context(
+        PLUGIN._Reference("CSOURCE", "1234567892.000003"), team_id="T_TEST",
+        destination_channel="DHOME", requester="UREQUESTER"))
+    assert "Verified source" in context
+    client.conversations_info.assert_awaited_once_with(channel="CSOURCE")
+    client.conversations_replies.assert_awaited_once()
+    primary.conversations_info.assert_not_awaited()
+    primary.conversations_replies.assert_not_awaited()
+    assert len(client.retry_handlers) == 1
+
+
+def test_conflicting_source_workspace_metadata_requires_membership():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    client = _access_client(is_private=False, context_team_id="T_TEST", team_id="TOTHER")
+    client.conversations_members.return_value = {"ok": True, "members": []}
+    assert "not fetched" in asyncio.run(_context_with_client(adapter, client))
+    client.conversations_replies.assert_not_awaited()
+    client.conversations_members.assert_awaited_once()
+
+
+def test_malformed_source_boolean_flags_fail_closed():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for flag in ("is_channel", "is_group", "is_im", "is_mpim"):
+        client = _access_client(is_private=False, context_team_id="T_TEST")
+        client.conversations_info.return_value["channel"][flag] = "false"
+        assert "not fetched" in asyncio.run(_context_with_client(adapter, client))
+        client.conversations_members.assert_not_awaited()
+        client.conversations_replies.assert_not_awaited()
+
+
+def test_malformed_user_account_flags_fail_closed_even_for_member():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for flag in ("deleted", "is_bot", "is_app_user", "is_restricted", "is_ultra_restricted",
+                 "is_stranger", "is_invited_user"):
+        client = _access_client(is_private=False, context_team_id="T_TEST")
+        client.users_info.return_value["user"][flag] = "false"
+        assert "not fetched" in asyncio.run(_context_with_client(adapter, client))
+        client.conversations_members.assert_not_awaited()
+        client.conversations_replies.assert_not_awaited()
+
+
+def test_access_attempts_disable_retries_without_mutating_workspace_client():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    attempts = []
+    class Client:
+        retry_handlers = [object()]
+        async def conversations_info(self, **kwargs):
+            attempts.append(("info", list(self.retry_handlers), kwargs))
+            return {"ok": True, "channel": {"id": "CSOURCE", "is_channel": True,
+                    "is_private": False, "context_team_id": "T_TEST"}}
+        async def users_info(self, **kwargs):
+            attempts.append(("user", list(self.retry_handlers), kwargs))
+            return {"ok": True, "user": {"id": "UREQUESTER", "is_restricted": True}}
+        async def conversations_members(self, **kwargs):
+            attempts.append(("members", list(self.retry_handlers), kwargs))
+            return {"ok": True, "members": ["UREQUESTER"]}
+    client = Client()
+    with patch.object(adapter, "_get_client", return_value=client):
+        assert asyncio.run(adapter._requester_source_access(
+            PLUGIN._Reference("CSOURCE", "1234567892.000003"), "T_TEST", "UREQUESTER"))
+    assert attempts == [("info", [], {"channel": "CSOURCE"}),
+                        ("user", [], {"user": "UREQUESTER"}),
+                        ("members", [], {"channel": "CSOURCE", "limit": 200})]
+    assert len(client.retry_handlers) == 1
+
+
+def test_verified_public_nonmember_can_share_to_dm_or_shared_destination():
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    for destination in ("DHOME", "CSHARED", "GSHARED"):
+        client = _access_client(is_private=False, context_team_id="T_TEST")
+        client.conversations_members.return_value = {"ok": True, "members": []}
+        with patch.object(adapter, "_get_client", return_value=client):
+            context = asyncio.run(adapter._linked_thread_context(
+                PLUGIN._Reference("CSOURCE", "1234567892.000003"), team_id="T_TEST",
+                destination_channel=destination, requester="UREQUESTER"))
+        assert "Verified source" in context
+        client.conversations_info.assert_awaited_once_with(channel="CSOURCE")
+        client.users_info.assert_awaited_once_with(user="UREQUESTER")
+        client.conversations_members.assert_not_awaited()
 
 
 if __name__ == "__main__":
