@@ -1204,6 +1204,334 @@ def test_verified_public_nonmember_can_share_to_dm_or_shared_destination():
         client.conversations_members.assert_not_awaited()
 
 
+def test_supplied_malformed_source_workspace_fails_closed():
+    for private in (False, True):
+        for key in ("context_team_id", "team_id"):
+            for value in (None, "", 0, False, [], {}, ["T_TEST"]):
+                adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+                client = _access_client(is_private=private, context_team_id="T_TEST")
+                client.conversations_info.return_value["channel"][key] = value
+                assert "not fetched" in asyncio.run(_context_with_client(adapter, client))
+                client.conversations_members.assert_not_awaited()
+                client.conversations_replies.assert_not_awaited()
+
+
+def test_supplied_malformed_public_user_workspace_fails_closed():
+    for value in (None, "", 0, False, [], {}, ["T_TEST"]):
+        adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+        client = _access_client(is_private=False, context_team_id="T_TEST")
+        client.users_info.return_value["user"]["team_id"] = value
+        assert "not fetched" in asyncio.run(_context_with_client(adapter, client))
+        client.conversations_members.assert_not_awaited()
+        client.conversations_replies.assert_not_awaited()
+
+
+def test_valid_differing_source_workspaces_preserve_membership_fallback():
+    for key in ("context_team_id", "team_id"):
+        for member in (False, True):
+            adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+            client = _access_client(is_private=False, context_team_id="T_TEST")
+            client.conversations_info.return_value["channel"][key] = "TOTHER"
+            client.conversations_members.return_value = {"ok": True, "members": ["UREQUESTER"] if member else []}
+            assert ("Verified source" in asyncio.run(_context_with_client(adapter, client))) is member
+            client.conversations_members.assert_awaited_once()
+
+
+def _latency_event(channels=("CSOURCE", "COTHER"), root=False, targets=None):
+    targets = targets or ["1234567892.000003"] * len(channels)
+    text = "<@UBOT> read " + " ".join(
+        f"https://acme.slack.com/archives/{channel}/p{ts.replace('.', '')}"
+        for channel, ts in zip(channels, targets))
+    raw = {"channel": "CHOME", "ts": "1234567893.000004", "user": "UREQUESTER", "text": text}
+    if root:
+        raw["thread_ts"] = "1234567890.000001"
+    return MessageEvent(text=text, raw_message=raw, source=SimpleNamespace(user_id="UREQUESTER"),
+                        metadata={"slack_team_id": "T_TEST"})
+
+
+async def _latency_deliver(adapter, client, event, budget=0.05):
+    with (patch.object(adapter, "_get_client", return_value=client),
+          patch.object(adapter, "_inbound_provenance", new_callable=AsyncMock, return_value="provenance"),
+          patch.object(PLUGIN, "_LINKED_TIMEOUT_SECONDS", budget, create=True),
+          patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock) as parent):
+        start = asyncio.get_running_loop().time()
+        await adapter.handle_message(event)
+        elapsed = asyncio.get_running_loop().time() - start
+        parent.assert_awaited_once_with(event)
+        return elapsed
+
+
+def _multi_source_client():
+    client = _access_client()
+    client.conversations_info.side_effect = lambda channel: {
+        "ok": True, "channel": {"id": channel, "is_channel": True, "is_private": True}}
+    return client
+
+
+def test_shared_linked_deadline_default_is_fifteen_seconds():
+    assert getattr(PLUGIN, "_LINKED_TIMEOUT_SECONDS", None) == 15.0
+
+
+def test_linked_sources_run_concurrently_with_ordered_output_and_two_limit():
+    async def scenario():
+        adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+        client = _multi_source_client()
+        active = peak = 0
+        both = asyncio.Event()
+        async def replies(channel, ts, **kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            if active == 2:
+                both.set()
+            try:
+                await asyncio.wait_for(both.wait(), 0.1)
+                await asyncio.sleep(0.01 if channel == "CSOURCE" else 0)
+                return {"messages": [{"ts": ts, "text": f"source-{channel}"}]}
+            finally:
+                active -= 1
+        client.conversations_replies.side_effect = replies
+        event = _latency_event(("CSOURCE", "COTHER", "CTHIRD"))
+        await _latency_deliver(adapter, client, event, 0.3)
+        assert peak == 2 and active == 0
+        assert event.channel_context.index("source-CSOURCE") < event.channel_context.index("source-COTHER")
+        assert "CTHIRD" not in event.channel_context
+        assert client.conversations_replies.await_count == 2
+        assert client.conversations_info.await_count == client.conversations_members.await_count == 2
+    asyncio.run(scenario())
+
+
+def test_shared_deadline_retains_completed_source_and_marks_pending_in_order():
+    async def scenario():
+        adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+        client = _multi_source_client()
+        cancelled = []
+        async def replies(channel, ts, **kwargs):
+            if channel == "CSOURCE":
+                try:
+                    await asyncio.sleep(0.15)
+                finally:
+                    cancelled.append(channel)
+            return {"messages": [{"ts": ts, "text": f"source-{channel}"}]}
+        client.conversations_replies.side_effect = replies
+        event = _latency_event()
+        elapsed = await _latency_deliver(adapter, client, event)
+        assert elapsed < 0.12
+        assert "source-COTHER" in event.channel_context and "source-CSOURCE" not in event.channel_context
+        assert "timeout" in event.channel_context.lower()
+        assert event.channel_context.index("CSOURCE") < event.channel_context.index("source-COTHER")
+        assert cancelled == ["CSOURCE"]
+        assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+    asyncio.run(scenario())
+
+
+def test_deadline_starts_before_delayed_destination_root_discovery():
+    async def scenario():
+        adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+        adapter._bot_user_id = "UBOT"
+        client = _multi_source_client()
+        async def replies(channel, ts, **kwargs):
+            if channel == "CHOME":
+                await asyncio.sleep(0.15)
+                return {"messages": [{"ts": ts, "text": "root"}]}
+            return {"messages": [{"ts": ts, "text": "must not read"}]}
+        client.conversations_replies.side_effect = replies
+        event = _latency_event(root=True)
+        assert await _latency_deliver(adapter, client, event) < 0.12
+        assert "timeout" in event.channel_context.lower()
+        client.conversations_info.assert_not_awaited()
+        assert client.conversations_replies.await_count == 1
+    asyncio.run(scenario())
+
+
+def test_delayed_root_discovery_spends_source_remaining_budget():
+    async def scenario():
+        adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+        adapter._bot_user_id = "UBOT"
+        client = _multi_source_client()
+        async def replies(channel, ts, **kwargs):
+            await asyncio.sleep(0.035)
+            return {"messages": [{"ts": ts, "text": "root" if channel == "CHOME" else "too late"}]}
+        client.conversations_replies.side_effect = replies
+        event = _latency_event(("CSOURCE",), root=True)
+        assert await _latency_deliver(adapter, client, event) < 0.085
+        assert "too late" not in event.channel_context
+        assert "timeout" in event.channel_context.lower()
+    asyncio.run(scenario())
+
+
+def test_shared_deadline_covers_access_and_never_reads_unverified_source():
+    async def scenario():
+        for method in ("conversations_info", "conversations_members", "users_info"):
+            adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+            client = _access_client(is_private=method != "users_info", context_team_id="T_TEST")
+            async def hanging(**kwargs):
+                await asyncio.sleep(0.15)
+            getattr(client, method).side_effect = hanging
+            event = _latency_event(("CSOURCE",))
+            assert await _latency_deliver(adapter, client, event) < 0.12
+            assert "timeout" in event.channel_context.lower()
+            client.conversations_replies.assert_not_awaited()
+        # The deadline is shared across pagination, not reset for each attempt.
+        adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+        client = _access_client()
+        async def delayed_page(**kwargs):
+            await asyncio.sleep(0.03)
+            return {"ok": True, "members": [], "response_metadata": {"next_cursor": "more"}}
+        client.conversations_members.side_effect = delayed_page
+        event = _latency_event(("CSOURCE",))
+        assert await _latency_deliver(adapter, client, event) < 0.085
+        assert "timeout" in event.channel_context.lower()
+        assert client.conversations_members.await_count == 2
+        client.conversations_replies.assert_not_awaited()
+    asyncio.run(scenario())
+
+
+def test_exact_target_lookup_uses_remaining_deadline():
+    async def scenario():
+        adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={"linked_thread_max_messages": 1}))
+        client = _access_client()
+        async def replies(**kwargs):
+            if "oldest" in kwargs:
+                await asyncio.sleep(0.15)
+                return {"messages": [{"ts": kwargs["ts"], "text": "too late"}]}
+            await asyncio.sleep(0.02)
+            return {"messages": [{"ts": "1234567890.000001", "text": "root"}], "has_more": True}
+        client.conversations_replies.side_effect = replies
+        event = _latency_event(("CSOURCE",))
+        assert await _latency_deliver(adapter, client, event) < 0.12
+        assert "timeout" in event.channel_context.lower() and "too late" not in event.channel_context
+        assert client.conversations_replies.await_count == 2
+        assert client.conversations_replies.await_args.kwargs["oldest"] == "1234567892.000003"
+    asyncio.run(scenario())
+
+
+def test_optional_linked_api_copies_disable_retries_including_root_and_exact():
+    attempts = []
+    class Client:
+        retry_handlers = [object()]
+        async def conversations_info(self, **kwargs):
+            attempts.append(("info", list(self.retry_handlers)))
+            return {"ok": True, "channel": {"id": kwargs["channel"], "is_channel": True, "is_private": True}}
+        async def conversations_members(self, **kwargs):
+            attempts.append(("members", list(self.retry_handlers)))
+            return {"ok": True, "members": ["UREQUESTER"]}
+        async def conversations_replies(self, **kwargs):
+            attempts.append(("replies", list(self.retry_handlers)))
+            if kwargs["channel"] == "CHOME":
+                return {"messages": [{"ts": kwargs["ts"], "text": "root"}]}
+            if "oldest" in kwargs:
+                return {"messages": [{"ts": kwargs["ts"], "text": "exact"}]}
+            return {"messages": [{"ts": "1234567890.000001", "text": "source root"}], "has_more": True}
+    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={"linked_thread_max_messages": 1}))
+    adapter._bot_user_id = "UBOT"
+    client = Client()
+    event = _latency_event(("CSOURCE",), root=True)
+    asyncio.run(_latency_deliver(adapter, client, event, 0.3))
+    assert attempts == [("replies", []), ("info", []), ("members", []), ("replies", []), ("replies", [])]
+    assert len(client.retry_handlers) == 1
+    assert "SHARED MESSAGE" in event.channel_context and "exact" in event.channel_context
+
+
+def test_concurrent_duplicate_channel_access_single_flight_and_next_turn_rechecks():
+    async def scenario():
+        adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+        client = _access_client()
+        async def info(channel):
+            await asyncio.sleep(0.01)
+            return {"ok": True, "channel": {"id": channel, "is_channel": True, "is_private": True}}
+        client.conversations_info.side_effect = info
+        client.conversations_replies.side_effect = lambda ts, **kwargs: {"messages": [{"ts": ts, "text": "allowed"}]}
+        targets = ["1234567892.000003", "1234567891.000002"]
+        event = _latency_event(("CSOURCE", "CSOURCE"), targets=targets)
+        await _latency_deliver(adapter, client, event, 0.3)
+        assert event.channel_context.count("SHARED MESSAGE") == 2
+        assert client.conversations_info.await_count == client.conversations_members.await_count == 1
+        client.conversations_members.return_value = {"ok": True, "members": []}
+        event = _latency_event(("CSOURCE", "CSOURCE"), targets=targets)
+        await _latency_deliver(adapter, client, event, 0.3)
+        assert event.channel_context.count("not fetched") == 2
+        assert client.conversations_info.await_count == client.conversations_members.await_count == 2
+        assert client.conversations_replies.await_count == 2
+        # Concurrent turns on the same adapter must not share in-flight permissions,
+        # even when source channel is the same and team/requester differ.
+        client.conversations_members.return_value = {"ok": True, "members": ["UREQUESTER"]}
+        allowed = _latency_event(("CSOURCE",))
+        denied = _latency_event(("CSOURCE",))
+        denied.source.user_id = denied.raw_message["user"] = "UOTHER"
+        denied.metadata["slack_team_id"] = "TOTHER"
+        with (patch.object(adapter, "_get_client", return_value=client) as select,
+              patch.object(adapter, "_inbound_provenance", new_callable=AsyncMock, return_value="provenance"),
+              patch.object(PLUGIN, "_LINKED_TIMEOUT_SECONDS", 0.3),
+              patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock)):
+            await asyncio.gather(adapter.handle_message(allowed), adapter.handle_message(denied))
+        assert "allowed" in allowed.channel_context and "not fetched" in denied.channel_context
+        assert client.conversations_info.await_count == client.conversations_members.await_count == 4
+        assert client.conversations_replies.await_count == 3
+        assert {call.kwargs["team_id"] for call in select.call_args_list} == {"T_TEST", "TOTHER"}
+    asyncio.run(scenario())
+
+
+def test_linked_cancellation_propagates_and_drains_all_children():
+    async def scenario():
+        adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+        client = _access_client()
+        started = asyncio.Event()
+        ended = []
+        async def info(**kwargs):
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            finally:
+                ended.append(True)
+        client.conversations_info.side_effect = info
+        event = _latency_event(("CSOURCE", "CSOURCE"), targets=["1234567892.000003", "1234567891.000002"])
+        task = asyncio.create_task(_latency_deliver(adapter, client, event, 0.3))
+        await started.wait()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("caller cancellation swallowed")
+        assert ended == [True]
+        client.conversations_replies.assert_not_awaited()
+        assert not [t for t in asyncio.all_tasks() if t is not asyncio.current_task() and not t.done()]
+    asyncio.run(scenario())
+
+
+def test_per_attempt_source_read_timeout_is_bounded_independently():
+    async def scenario():
+        adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+        client = _access_client()
+        async def hanging(**kwargs):
+            await asyncio.sleep(0.15)
+        client.conversations_replies.side_effect = hanging
+        event = _latency_event(("CSOURCE",))
+        with patch.object(PLUGIN, "_ACCESS_TIMEOUT_SECONDS", 0.01):
+            assert await _latency_deliver(adapter, client, event, 0.3) < 0.08
+        assert "timeout" in event.channel_context.lower()
+    asyncio.run(scenario())
+
+
+def test_linked_budget_does_not_bound_provenance_history_or_entire_turn():
+    async def scenario():
+        adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+        client = _access_client()
+        event = _latency_event(("CSOURCE",))
+        async def slow_provenance(*args):
+            await asyncio.sleep(0.03)
+            return "slow provenance"
+        with (patch.object(adapter, "_get_client", return_value=client),
+              patch.object(adapter, "_inbound_provenance", side_effect=slow_provenance),
+              patch.object(PLUGIN, "_LINKED_TIMEOUT_SECONDS", 0.01, create=True),
+              patch.object(PLUGIN.bundled_slack.SlackAdapter, "handle_message", new_callable=AsyncMock)):
+            await adapter.handle_message(event)
+        assert "slow provenance" in event.channel_context and "Verified source" in event.channel_context
+    asyncio.run(scenario())
+
+
 if __name__ == "__main__":
     tests = [
         value
