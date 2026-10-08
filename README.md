@@ -79,7 +79,7 @@ platforms:
 
 The history limit is clamped to `0`–`100`; the assembled channel-context block is capped at 12,000 characters. The complete quoted forwarded-content block (text and file markers together) is separately capped at 12,000 characters. This is message-count based, not a rolling time window.
 
-Linked source threads fetch up to 100 messages by default (configurable `1`–`200`), with at most two distinct references and three API pages per thread per turn. Some Slack app classes are limited to 15 results and one `conversations.replies` call per minute; in that case retrieval can be partial or rate-limited. When a thread exceeds the limit or context budget, the block says `TRUNCATED`; it does not pretend to contain the whole thread.
+Linked source threads fetch up to 100 messages by default (configurable `1`–`200`), with at most two distinct references and three API pages per thread per turn. All linked enrichment shares a **15-second deadline per turn**, starting before destination-root reference inspection and covering requester access checks, source-thread reads, pagination, and exact-target lookup. Up to two references run concurrently; output keeps reference order and completed source contexts survive the deadline. Uncompleted references are explicitly marked timeout/unavailable. This deadline applies **only to optional linked enrichment**, not current-message provenance, channel-history backfill, forwarded-media handling, or the whole turn. Some Slack app classes are limited to 15 results and one `conversations.replies` call per minute; in that case retrieval can be partial or rate-limited. When a thread exceeds the limit or context budget, the block says `TRUNCATED`; it does not pretend to contain the whole thread.
 
 ### Slack scopes
 
@@ -90,7 +90,20 @@ The existing Hermes Slack bot credentials are reused. Channel history requires:
 - bot membership in the channel.
 
 Forwarded files remain subject to Slack visibility, OAuth scopes, workspace membership, and Hermes's normal MIME and size limits. The plugin does not bypass Slack authorization and does not fetch file URLs through a separate downloader.
-Source-thread retrieval uses the same bot token and requires the corresponding history scope and bot membership in the **source** conversation. Cross-channel public-channel resolution also requires `channels:read` for `conversations.info` to verify visibility; if that check fails the plugin does not fetch the thread. An inaccessible reference cannot be resolved from its URL alone.
+Source-thread retrieval uses the existing workspace-selected client and token; it adds no credentials or user-token flow. Slack must permit that token to call `conversations.replies` in the **source** conversation, with `channels:history`, `groups:history`, `im:history`, or `mpim:history` as appropriate, and bot membership where Slack requires it. Proving the requester's access does not grant the bot access: Slack can still reject a read because of token type, membership, scopes, workspace policies, or rate limits. An inaccessible reference cannot be resolved from its URL alone.
+
+Cross-conversation requester access checks require the corresponding read scope for both `conversations.info` and `conversations.members`:
+
+| Source conversation | Read scope |
+| --- | --- |
+| Public channel | `channels:read` |
+| Private channel | `groups:read` |
+| DM (IM) | `im:read` |
+| Group DM (MPIM) | `mpim:read` |
+
+Public-channel checks also call `users.info`, requiring `users:read`. No email scope is needed. Missing scopes, API errors (including rate limits), timeouts, invalid responses, and unknown requester identity fail closed **before** reading the cross-conversation source thread. Reinstall/re-authorize the Slack app separately if its scopes need changing; this plugin never updates Slack permissions itself.
+
+See Slack's method references for [conversation members](https://docs.slack.dev/reference/methods/conversations.members/), [user information](https://docs.slack.dev/reference/methods/users.info/), and [thread replies](https://docs.slack.dev/reference/methods/conversations.replies/).
 
 ## Behavior
 
@@ -130,7 +143,20 @@ When an authorized message contains a Slack message permalink in authored text/b
 
 If you reply to an earlier message and **mention Hermes in your reply**, the plugin also checks that thread's root for a link or forward. The root need not have mentioned Hermes. It does not recursively follow links found inside a retrieved source thread. Forwards with copied text but no usable original channel/message identifier can still display the quote, but cannot retrieve the original thread.
 
-To avoid exposing a private source thread to a different destination, cross-channel sources must be confirmed public by Slack's `conversations.info`; an ID beginning with `C` alone is **not** proof of public visibility (Slack Connect can retain a `C` ID for a private channel). The destination must also be verified as an unshared internal channel: a public internal source cannot be quoted into a Slack Connect channel with external participants. Private-channel and DM references are not fetched across channels, even if the bot can read both. These checks fail closed when channel metadata or required read scopes are unavailable. Retrieval failure and an unverified target are explicitly marked. When a shared reply is beyond the configured thread scan, a targeted API lookup attempts to retrieve the specific reply; surrounding content is still marked truncated. Retrieved text is untrusted reference data, not a new user request. Source-thread file attachments are rendered as Slack message metadata; this feature does not automatically download every file from a fetched thread.
+**Sharing policy: the current requester may share anything they can access, anywhere.** The plugin does not classify sharing intent, inspect destination metadata, verify recipient access, or restrict destination types. DMs, private channels, and Slack Connect/shared destinations are allowed. Posting a link/forward is sufficient to invoke bounded source resolution; no extra confirmation or intent classification is added.
+
+For a source different from the accepted inbound conversation:
+
+- Take the requester from the **current** `MessageEvent.source.user_id`, falling back only to the authenticated current raw Slack event's `user` when source identity is absent. Conflicting transport identities fail closed. Forwarded-message authors, source authors, and the destination thread-root author never substitute for the current requester, including when a later mention discovers a reference on that root.
+- Verify source ID and conversation type through `conversations.info`. A `C` prefix alone is not evidence of public visibility.
+- Require explicit requester membership from `conversations.members` for private channels, IMs, MPIMs, guests, and external users. Bot membership alone is never sufficient.
+- Allow public-channel nonmembers only when `users.info` confirms the same-workspace, active, nonbot, non-app, non-guest user, and source `context_team_id` or `team_id` matches the inbound workspace (all supplied source team IDs must agree). Known stranger/pending-invitation users require membership. Absent account flags or absent workspace metadata conservatively require membership instead, as do valid differing workspace IDs. Supplied source `context_team_id`/`team_id` and public user `team_id` must be nonempty strings: a supplied empty or nonstring value fails closed even for a member. Other malformed metadata or a failed API lookup is also a denial, not a membership fallback.
+
+If source and destination are the **same conversation**, the plugin relies on the bundled Slack adapter's already-accepted inbound authorization/routing checks and does not make redundant access lookups. This is not an independent authorization mechanism for callers bypassing the bundled inbound pipeline.
+
+Every optional linked-enrichment API request (destination-root discovery, access checks, source reads, and exact-target lookup) uses a shallow copy of the existing channel/team-selected workspace client, with SDK retries disabled without changing the shared client. Each API attempt is bounded to the smaller of two seconds and the remaining shared 15-second budget. Membership scans request 200 IDs per page, stop on a verified member, and allow at most ten pages; an exhausted scan, repeated cursor, or invalid response fails closed. A member beyond those pages may therefore be denied. In the longest public fallback path, access verification makes at most twelve API calls per source (one source lookup, one user lookup, ten membership pages), subject to the overall deadline. Requester access results, including denials and concurrent in-flight duplicates, are memoized only within the current turn by workspace/source channel/requester. No permission cache survives into a later turn: access is rechecked then. Timeout and caller cancellation cancel and drain owned tasks; no enrichment task runs detached. Exceptions are logged by class only, without raw Slack response/error data or secrets.
+
+Retrieval failure and an unverified target are explicitly marked. When a shared reply is beyond the configured thread scan, a targeted API lookup attempts to retrieve the specific reply within the remaining deadline; surrounding content is still marked truncated. Existing source-thread message/page/character bounds remain unchanged. Cross-conversation source reads never begin before requester access is verified. Access verification and the subsequent bot read are not an atomic Slack operation; membership could change between them. Retrieved text is untrusted reference data, not a new user request. Source-thread file attachments are rendered as Slack message metadata; this feature does not automatically download every file from a fetched thread.
 
 ## Validation
 
@@ -164,7 +190,10 @@ After installation, test these Slack cases:
 8. Paste a permalink to a root and to a reply: both show the source thread and mark the precise shared message.
 9. Forward a source message with a usable original permalink/ID and inspect its source thread.
 10. Post an unaddressed root containing a source link/forward, then reply with a mention: the source thread appears.
-11. Cross-channel private references fail closed; long threads are labeled truncated.
+11. Share private-channel/DM sources as a member into a DM or shared destination: source resolution is allowed without destination/recipient checks.
+12. Try the same sources as a nonmember: resolution fails closed, even when the bot or forwarded/root author is a member.
+13. Test a public nonmember internal user, a guest, and an external user: only the verified ordinary internal user bypasses membership.
+14. Verify missing read/user scopes fail closed and long threads remain labeled truncated.
 
 ## Security and operational notes
 

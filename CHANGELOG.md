@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — Requester-based source access
+
+- Reject supplied empty/nonstring source workspace IDs and public-user team IDs before membership fallback; preserve fallback for absent metadata and valid differing workspace IDs.
+- Share a 15-second linked-enrichment deadline across destination-root inspection, requester authorization, source pagination, and exact-target lookup. Process at most two references concurrently in reference order, retain completed contexts, and mark unfinished references timeout/unavailable. The deadline does not cover provenance, history backfill, or the entire turn.
+- Disable SDK retries on copied clients for every optional linked-enrichment API request; bound each attempt to two seconds or the remaining shared budget. Memoize requester access only within a turn by workspace/channel/requester, including concurrent duplicates, and freshly recheck later turns. Cancel and drain all owned tasks on timeout/cancellation.
+- Add small-budget regressions for malformed/absent/differing metadata, concurrent ordered results, root discovery, authorization/pagination, reads/exact lookup, retry isolation, per-turn access memoization, completed-result retention, and cancellation cleanup.
+- Replace private-source/shared-destination bans with the policy that the current requester may share anything they can access, anywhere; do not classify intent or check destination/recipient access.
+- Use the accepted current event's source user (authenticated current raw user fallback), never forwarded or thread-root authors, including references discovered by later mentions. Reject conflicting/missing transport identity for cross-conversation retrieval.
+- Verify source metadata and bounded paginated requester membership for private channels, DMs, group DMs, guests, and external users. Public nonmembers require `users.info` evidence of an active ordinary internal user and matching source/workspace metadata; otherwise require membership.
+- Fail closed before source-thread reads on lookup errors, missing scopes, malformed responses, or exhausted membership scans. Bound access API attempts to two seconds and membership pagination to ten pages of 200 IDs; disable SDK retries on a client copy without mutating the existing workspace client.
+- Preserve same-conversation accepted-inbound access, source-thread bounds, exact-target/truncation behavior, provenance, forwarded media, and command/synthetic bypass. Document required read/user scopes, token/API limitations, non-atomic permission checks, and conservative denials; add requester/access regressions.
+
 ## 0.3.1 — Inbound message provenance
 
 - Prepend current message and distinct thread-root channel/timestamp/permalink provenance to `event.channel_context`, independently of linked/forwarded sources and without changing command text.
