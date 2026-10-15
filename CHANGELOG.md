@@ -1,23 +1,18 @@
 # Changelog
 
-## Unreleased — Colleague mode
+## 0.4.0 — Colleague mode
 
-- Add opt-in `solo_thread_follow`: unmentioned thread replies are followed only while the thread has a single human participant (authors plus humans mentioned in human messages; `@here`/`@channel`/user groups count as several). Once a second human appears, the thread requires an explicit mention. Bots, free-response channels and DMs are unaffected; participant lookup errors fail silent. Requires `strict_mention` and `thread_require_mention` to be false.
-- Paginate thread context and keep the root plus the newest replies (`thread_context_max_messages`, default 60, max 300) instead of Slack's oldest-first first page, fixing mid-thread mentions and watermark catch-up in long threads.
-- Register read-only agent tools in a `slack` toolset with bot-token visibility: `slack_read_thread` (permalink or channel+ts, recursive forward rendering with source links and file ids), `slack_read_channel`, `slack_list_channels`, `slack_download_file` (Slack-host-only token use, local cache path). Registering them switches the Slack platform note to "has Slack tools". Set `HERMES_SLACK_READ_TOOLS=0` to skip.
-- Add `tests/test_colleague.py` (14 regressions for gating, context selection, reference parsing, nested forwards and download host checks).
+Rewrite around one rule: inject the local conversation, reference everything else.
 
-## Unreleased — Requester-based source access
-
-- Reject supplied empty/nonstring source workspace IDs and public-user team IDs before membership fallback; preserve fallback for absent metadata and valid differing workspace IDs.
-- Share a 15-second linked-enrichment deadline across destination-root inspection, requester authorization, source pagination, and exact-target lookup. Process at most two references concurrently in reference order, retain completed contexts, and mark unfinished references timeout/unavailable. The deadline does not cover provenance, history backfill, or the entire turn.
-- Disable SDK retries on copied clients for every optional linked-enrichment API request; bound each attempt to two seconds or the remaining shared budget. Memoize requester access only within a turn by workspace/channel/requester, including concurrent duplicates, and freshly recheck later turns. Cancel and drain all owned tasks on timeout/cancellation.
-- Add small-budget regressions for malformed/absent/differing metadata, concurrent ordered results, root discovery, authorization/pagination, reads/exact lookup, retry isolation, per-turn access memoization, completed-result retention, and cancellation cleanup.
-- Replace private-source/shared-destination bans with the policy that the current requester may share anything they can access, anywhere; do not classify intent or check destination/recipient access.
-- Use the accepted current event's source user (authenticated current raw user fallback), never forwarded or thread-root authors, including references discovered by later mentions. Reject conflicting/missing transport identity for cross-conversation retrieval.
-- Verify source metadata and bounded paginated requester membership for private channels, DMs, group DMs, guests, and external users. Public nonmembers require `users.info` evidence of an active ordinary internal user and matching source/workspace metadata; otherwise require membership.
-- Fail closed before source-thread reads on lookup errors, missing scopes, malformed responses, or exhausted membership scans. Bound access API attempts to two seconds and membership pagination to ten pages of 200 IDs; disable SDK retries on a client copy without mutating the existing workspace client.
-- Preserve same-conversation accepted-inbound access, source-thread bounds, exact-target/truncation behavior, provenance, forwarded media, and command/synthetic bypass. Document required read/user scopes, token/API limitations, non-atomic permission checks, and conservative denials; add requester/access regressions.
+- Add `solo_thread_follow`: thread follow-ups continue while one human is in the thread and need a mention once a second human writes or is mentioned there (`@here`/`@channel`/user groups count as several). Restricts, never extends, the bundled follow rules. Free-response channels and DMs are unaffected; lookup failures stay silent.
+- Add `thread_context_max_messages`: thread context is the root plus the newest replies (not Slack's oldest page), and the catch-up after a mention contains every message since Hermes' last turn except its own replies (up to 200). Both say how many messages were left out and how to read them. Threads are paged with per-page timeouts; very long threads keep the newest 1000 in memory.
+- Add read-only tools in a `slack` toolset: `slack_read_thread`, `slack_read_channel`, `slack_list_channels`, `slack_download_file`. Output is size-bounded; the token is sent only to the bundled adapter's Slack CDN hosts; downloads are byte-capped and expire after 7 days.
+- Render forwards of forwards inline with their source IDs; promote their files too.
+- Replace automatic linked-thread fetching with a one-line list of referenced Slack messages (`channel`/`ts`/`thread_ts`) for the tools. Remove `linked_thread_max_messages`.
+- Replace the provenance block (two `chat.getPermalink` calls and ~900 characters per message) with one line: IDs plus a permalink built from a cached `auth.test` workspace URL.
+- Remove the requester source-access layer (membership scans, shared deadlines, single-flight tasks): Slack's own visibility is the access boundary.
+- Thread and channel lines carry `[ts=…]` instead of `[Slack message: channel=… ts=…]`; backfilled messages show their reply count.
+- Rename the adapter class to `SlackColleagueAdapter`. Replace the 86 mock-heavy tests with 38 behaviour tests in four files, including thread scenarios.
 
 ## 0.3.1 — Inbound message provenance
 

@@ -1,24 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from gateway.config import PlatformConfig
 
-
-ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location(
-    "slack_context_forwarding_colleague", ROOT / "__init__.py", submodule_search_locations=[str(ROOT)])
-assert SPEC and SPEC.loader
-PLUGIN = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = PLUGIN
-SPEC.loader.exec_module(PLUGIN)
-from slack_context_forwarding_colleague import slack_tools as TOOLS  # noqa: E402
+from helpers import PLUGIN, TOOLS, run_tests
 
 BOT = "UBOT"
 HUGO = "UHUGO"
@@ -26,7 +16,7 @@ ALICE = "UALICE"
 
 
 def _adapter(**extra):
-    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={"solo_thread_follow": True, **extra}))
+    adapter = PLUGIN.SlackColleagueAdapter(PlatformConfig(extra={"solo_thread_follow": True, **extra}))
     adapter._bot_user_id = BOT
     return adapter
 
@@ -106,7 +96,7 @@ def test_explicit_mention_still_answers_in_multiplayer_thread():
 
 def test_base_gate_rejection_is_final_and_disabled_mode_is_untouched():
     assert _gate(_adapter(), _client(SOLO), base=False) is False
-    adapter = PLUGIN.SlackHistoryBackfillAdapter(PlatformConfig(extra={}))
+    adapter = PLUGIN.SlackColleagueAdapter(PlatformConfig(extra={}))
     adapter._bot_user_id = BOT
     multi = SOLO + [_msg("1700000000.000004", ALICE, "hm")]
     assert _gate(adapter, _client(multi)) is True
@@ -119,7 +109,7 @@ def test_participant_lookup_failure_requires_a_mention():
 
 def test_free_response_channel_is_not_restricted():
     multi = SOLO + [_msg("1700000000.000004", ALICE, "hm")]
-    with patch.object(PLUGIN.SlackHistoryBackfillAdapter, "_slack_free_response_channels",
+    with patch.object(PLUGIN.SlackColleagueAdapter, "_slack_free_response_channels",
                       return_value={"C1"}):
         assert _gate(_adapter(), _client(multi)) is True
 
@@ -144,7 +134,17 @@ def test_thread_context_keeps_root_and_newest_replies():
     kept = result["messages"]
     assert kept[0]["text"] == "root"
     assert kept[-1]["text"] == "reply 150"
-    assert len(kept) == 31  # bundled limit wins when larger than the configured context size
+    assert len(kept) == 11  # root + 10 newest (the configured maximum, incl. the current message)
+
+
+def test_thread_context_is_untouched_when_not_configured():
+    adapter = PLUGIN.SlackColleagueAdapter(PlatformConfig(extra={}))
+    base = AsyncMock(return_value={"ok": True, "messages": ["bundled"]})
+
+    async def run():
+        with patch.object(PLUGIN.bundled_slack.SlackAdapter, "_conversations_replies_with_backoff", new=base):
+            return await adapter._conversations_replies_with_backoff("C1", "1700000000.000001", 31, "T1")
+    assert asyncio.run(run())["messages"] == ["bundled"]
 
 
 def test_tool_reference_parsing():
@@ -183,6 +183,7 @@ def test_tool_renders_nested_forwards_with_files_and_sources():
 
 def test_download_refuses_non_slack_hosts():
     assert TOOLS._safe_cdn("https://files.slack.com/files-pri/T1-F1/x.png")
+    assert not TOOLS._safe_cdn("https://slack-edge.evil.example/x")
     assert not TOOLS._safe_cdn("https://files.slack.com.evil.example/x")
     assert not TOOLS._safe_cdn("http://files.slack.com/x")
 
@@ -193,8 +194,87 @@ def test_tool_errors_are_json_without_secrets():
     assert "token" in out["error"].lower() and "xox" not in out["error"]
 
 
+class FakeSlack:
+    """Answers WebClient calls from canned data."""
+
+    def __init__(self, **responses):
+        self.responses = responses
+
+    def __getattr__(self, method):
+        def call(**params):
+            value = self.responses[method]
+            return value(**params) if callable(value) else value
+        return call
+
+
+def _tools(fake, **patches):
+    return patch.multiple(TOOLS, _client=lambda: fake, _token=lambda: "xoxb-test",
+                          _user=lambda client, uid: (uid.lower(), False), **patches)
+
+
+def test_read_thread_from_a_reply_link_returns_root_and_newest_within_budget():
+    replies = [{"ts": "1700000000.000001", "user": "UROOT", "text": "root", "reply_count": 300}] + [
+        {"ts": f"1700000001.{i:06d}", "user": "UA", "thread_ts": "1700000000.000001", "text": "x" * 1500}
+        for i in range(300)]
+    fake = FakeSlack(conversations_replies={"messages": replies, "has_more": False},
+                     conversations_info={"channel": {"name": "general", "is_member": True}})
+    with _tools(fake):
+        out = json.loads(TOOLS.read_thread({
+            "link": "https://acme.slack.com/archives/C0ABCDEF1/p1700001000000299?thread_ts=1700000000.000001"}))
+    texts = [m["text"] for m in out["messages"]]
+    assert texts[0] == "root" and out["messages"][-1]["ts"] == "1700000001.000299"
+    assert out["omitted_middle_messages"] > 0
+    assert len(json.dumps(out)) < TOOLS._MAX_OUTPUT + 5_000
+
+
+def test_channel_names_resolve_once():
+    calls = []
+
+    def channels(**params):
+        calls.append(params)
+        return {"channels": [{"id": "C0GENERAL1", "name": "general"}]}
+    fake = FakeSlack(conversations_list=channels)
+    TOOLS._channel_ids.clear()
+    assert TOOLS._resolve_channel(fake, "general") == "C0GENERAL1"
+    assert TOOLS._resolve_channel(fake, "general") == "C0GENERAL1"
+    assert len(calls) == 1
+    assert TOOLS._resolve_channel(fake, "C0GENERAL1") == "C0GENERAL1"
+
+
+def _download(tmp, handler, info=None):
+    import httpx
+    fake = FakeSlack(files_info={"file": info or {
+        "id": "F0FILE0001", "name": "report final.pdf", "mimetype": "application/pdf", "size": 3,
+        "url_private_download": "https://files.slack.com/files-pri/T1-F0FILE0001/report.pdf"}})
+    with (_tools(fake, _http=lambda: httpx.Client(transport=httpx.MockTransport(handler))),
+          patch.dict("os.environ", {"HERMES_HOME": str(tmp)}),
+          patch("hermes_constants.get_hermes_home", return_value=tmp)):
+        return json.loads(TOOLS.download_file({"file_id": "F0FILE0001"}))
+
+
+def test_download_saves_file_and_sends_token_only_to_slack(tmp_path=None):
+    import tempfile
+    import httpx
+    tmp = Path(tempfile.mkdtemp())
+    seen = []
+
+    def ok(request):
+        seen.append((request.url.host, request.headers.get("authorization")))
+        return httpx.Response(200, content=b"PDF")
+    out = _download(tmp, ok)
+    assert Path(out["path"]).read_bytes() == b"PDF" and Path(out["path"]).parent == tmp / "cache" / "slack-files"
+    assert seen == [("files.slack.com", "Bearer xoxb-test")]
+
+    def evil_redirect(request):
+        seen.append(request.url.host)
+        return httpx.Response(302, headers={"location": "https://evil.example/steal"})
+    assert "unexpected host" in _download(tmp, evil_redirect)["error"]
+    assert "evil.example" not in seen
+
+    def sign_in(request):
+        return httpx.Response(200, content=b"<!DOCTYPE html><html>sign in</html>")
+    assert "sign-in page" in _download(tmp, sign_in)["error"]
+
+
 if __name__ == "__main__":
-    tests = [value for name, value in sorted(globals().items()) if name.startswith("test_") and callable(value)]
-    for test in tests:
-        test()
-    print(f"colleague_smoke=passed tests={len(tests)}")
+    run_tests(globals(), "colleague")

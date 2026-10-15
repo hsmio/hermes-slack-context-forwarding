@@ -1,6 +1,13 @@
+slack:
+  require_mention: true
+  strict_mention: false
+  thread_require_mention: false
+  ignore_other_user_mentions: true
+
 platforms:
   slack:
     extra:
+      solo_thread_follow: true
+      thread_context_max_messages: 30
       history_backfill: true
       history_backfill_limit: 15
-      linked_thread_max_messages: 100
