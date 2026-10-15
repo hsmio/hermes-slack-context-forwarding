@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased — Colleague mode
+
+- Add opt-in `solo_thread_follow`: unmentioned thread replies are followed only while the thread has a single human participant (authors plus humans mentioned in human messages; `@here`/`@channel`/user groups count as several). Once a second human appears, the thread requires an explicit mention. Bots, free-response channels and DMs are unaffected; participant lookup errors fail silent. Requires `strict_mention` and `thread_require_mention` to be false.
+- Paginate thread context and keep the root plus the newest replies (`thread_context_max_messages`, default 60, max 300) instead of Slack's oldest-first first page, fixing mid-thread mentions and watermark catch-up in long threads.
+- Register read-only agent tools in a `slack` toolset with bot-token visibility: `slack_read_thread` (permalink or channel+ts, recursive forward rendering with source links and file ids), `slack_read_channel`, `slack_list_channels`, `slack_download_file` (Slack-host-only token use, local cache path). Registering them switches the Slack platform note to "has Slack tools". Set `HERMES_SLACK_READ_TOOLS=0` to skip.
+- Add `tests/test_colleague.py` (14 regressions for gating, context selection, reference parsing, nested forwards and download host checks).
+
 ## Unreleased — Requester-based source access
 
 - Reject supplied empty/nonstring source workspace IDs and public-user team IDs before membership fallback; preserve fallback for absent metadata and valid differing workspace IDs.

@@ -81,6 +81,26 @@ The history limit is clamped to `0`–`100`; the assembled channel-context block
 
 Linked source threads fetch up to 100 messages by default (configurable `1`–`200`), with at most two distinct references and three API pages per thread per turn. All linked enrichment shares a **15-second deadline per turn**, starting before destination-root reference inspection and covering requester access checks, source-thread reads, pagination, and exact-target lookup. Up to two references run concurrently; output keeps reference order and completed source contexts survive the deadline. Uncompleted references are explicitly marked timeout/unavailable. This deadline applies **only to optional linked enrichment**, not current-message provenance, channel-history backfill, forwarded-media handling, or the whole turn. Some Slack app classes are limited to 15 results and one `conversations.replies` call per minute; in that case retrieval can be partial or rate-limited. When a thread exceeds the limit or context budget, the block says `TRUNCATED`; it does not pretend to contain the whole thread.
 
+### Colleague mode (optional)
+
+```yaml
+slack:
+  require_mention: true
+  strict_mention: false
+  thread_require_mention: false
+  ignore_other_user_mentions: true
+
+platforms:
+  slack:
+    extra:
+      solo_thread_follow: true
+      thread_context_max_messages: 60
+```
+
+With `solo_thread_follow`, Hermes follows a thread without mentions while it is the only human's conversation with Hermes; once another human writes or is mentioned there, it answers only when @mentioned. Thread context keeps the root plus the newest replies.
+
+The plugin also registers read-only Slack tools (`slack_read_thread`, `slack_read_channel`, `slack_list_channels`, `slack_download_file`) in a `slack` toolset. They see exactly what the bot token sees. Set `HERMES_SLACK_READ_TOOLS=0` in the gateway environment to skip them.
+
 ### Slack scopes
 
 The existing Hermes Slack bot credentials are reused. Channel history requires:

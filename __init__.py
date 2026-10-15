@@ -13,6 +13,7 @@ import asyncio
 import copy
 import html
 import logging
+import os
 import re
 from typing import Any, NamedTuple
 from urllib.parse import parse_qs, urlsplit
@@ -47,6 +48,12 @@ _REFERENCE_MAX_PAGES = 3
 _SLACK_URL_RE = re.compile(r"https?://[^\s<>|]+/archives/[A-Z0-9]+/p\d{16,18}[^\s<>|]*", re.IGNORECASE)
 _CHANNEL_RE = re.compile(r"[CDG][A-Z0-9]+\Z")
 _TS_RE = re.compile(r"\d{10,12}\.\d{6}\Z")
+_USER_MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>")
+_GROUP_MENTION_RE = re.compile(r"<!(?:here|channel|everyone|subteam\^[A-Z0-9]+)")
+_THREAD_FETCH_MAX = 1000
+_THREAD_FETCH_TTL_SECONDS = 5.0
+_THREAD_CONTEXT_DEFAULT = 60
+_THREAD_CONTEXT_MAX = 300
 
 
 class _Reference(NamedTuple):
@@ -274,6 +281,117 @@ class SlackHistoryBackfillAdapter(bundled_slack.SlackAdapter):
         except (TypeError, ValueError):
             value = _DEFAULT_LIMIT
         return max(0, min(value, _MAX_LIMIT))
+
+    # ── Solo thread follow ───────────────────────────────────────────────────
+    # While a thread has a single human participant, Hermes follows it without
+    # mentions; once a second human writes or is mentioned there, it answers
+    # only when @mentioned. Requires the bundled strict_mention and
+    # thread_require_mention gates to be off so follow-ups reach this check.
+
+    def _solo_thread_follow_enabled(self) -> bool:
+        return _as_bool(self.config.extra.get("solo_thread_follow", False))
+
+    def _thread_context_limit(self) -> int:
+        try:
+            value = int(self.config.extra.get("thread_context_max_messages", _THREAD_CONTEXT_DEFAULT))
+        except (TypeError, ValueError):
+            value = _THREAD_CONTEXT_DEFAULT
+        return max(1, min(value, _THREAD_CONTEXT_MAX))
+
+    async def _thread_messages(self, channel_id: str, thread_ts: str, team_id: str) -> list[dict]:
+        """Whole thread, oldest first, bounded; briefly cached so gate and hydrate share one read."""
+        cache = self.__dict__.setdefault("_scf_thread_cache", {})
+        key = (team_id, channel_id, thread_ts)
+        now = asyncio.get_running_loop().time()
+        hit = cache.get(key)
+        if hit and now - hit[0] < _THREAD_FETCH_TTL_SECONDS:
+            return hit[1]
+        client = self._get_client(channel_id, team_id=team_id or None)
+        messages: list[dict] = []
+        cursor = ""
+        while len(messages) < _THREAD_FETCH_MAX:
+            params: dict[str, Any] = {"channel": channel_id, "ts": thread_ts, "limit": 200,
+                                      "inclusive": True}
+            if cursor:
+                params["cursor"] = cursor
+            response = await client.conversations_replies(**params)
+            messages.extend(m for m in response.get("messages") or [] if isinstance(m, dict))
+            cursor = str((response.get("response_metadata") or {}).get("next_cursor") or "")
+            if not cursor or not response.get("has_more"):
+                break
+        cache[key] = (now, messages)
+        if len(cache) > 500:
+            for stale in [k for k, v in cache.items() if now - v[0] >= _THREAD_FETCH_TTL_SECONDS]:
+                del cache[stale]
+        return messages
+
+    async def _thread_human_participants(
+        self, *, channel_id: str, thread_ts: str, team_id: str, routing_text: str,
+    ) -> set[str]:
+        """Human authors plus humans mentioned in human messages (``@here`` etc. count as many)."""
+        bots = {uid for uid in (self._bot_user_id, *self._team_bot_user_ids.values()) if uid}
+        humans: set[str] = set()
+        texts = [routing_text]
+        for msg in await self._thread_messages(channel_id, thread_ts, team_id):
+            if self._event_declares_bot_sender(msg):
+                continue
+            user = str(msg.get("user") or "")
+            if user in bots:
+                continue
+            if user:
+                humans.add(user)
+            texts.append(bundled_slack._slack_mention_detection_text(msg))
+        mentioned: set[str] = set()
+        for text in texts:
+            if _GROUP_MENTION_RE.search(text or ""):
+                humans.add("<group mention>")
+            mentioned.update(_USER_MENTION_RE.findall(text or ""))
+        for uid in sorted(mentioned - bots - humans):
+            if not await self._resolve_user_is_bot(uid, chat_id=channel_id, team_id=team_id):
+                humans.add(uid)
+        return humans
+
+    async def _channel_gate_allows(self, **kwargs: Any) -> bool:
+        allowed = await super()._channel_gate_allows(**kwargs)
+        if (not allowed or not self._solo_thread_follow_enabled() or kwargs.get("is_mentioned")
+                or kwargs.get("force_process") or not kwargs.get("is_thread_reply")):
+            return allowed
+        channel_id = str(kwargs.get("channel_id") or "")
+        if channel_id not in self._slack_require_mention_channels() and (
+                channel_id in self._slack_free_response_channels() or not self._slack_require_mention()):
+            return allowed  # Free-response channels answer everything anyway.
+        thread_ts = str(kwargs.get("event_thread_ts") or "")
+        try:
+            humans = await self._thread_human_participants(
+                channel_id=channel_id, thread_ts=thread_ts, team_id=str(kwargs.get("team_id") or ""),
+                routing_text=str(kwargs.get("routing_text") or ""))
+        except Exception as exc:
+            logger.info("[Slack] Thread participants unavailable; requiring a mention: %s",
+                        type(exc).__name__)
+            return False
+        others = humans - {str(kwargs.get("user_id") or "")}
+        if others:
+            logger.debug("[Slack] Multiplayer thread %s/%s (%d other humans): mention required",
+                         channel_id, thread_ts, len(others))
+            return False
+        return True
+
+    async def _conversations_replies_with_backoff(
+        self, channel_id: str, thread_ts: str, limit: int, team_id: str,
+    ) -> Any:
+        """Thread context keeps the root plus the NEWEST replies, not Slack's oldest first page."""
+        if limit <= 2:
+            return await super()._conversations_replies_with_backoff(channel_id, thread_ts, limit, team_id)
+        try:
+            messages = await self._thread_messages(channel_id, thread_ts, team_id)
+        except Exception:
+            return await super()._conversations_replies_with_backoff(channel_id, thread_ts, limit, team_id)
+        keep = max(limit, self._thread_context_limit() + 1)  # +1: the current message
+        if len(messages) > keep:
+            root = messages[0] if str(messages[0].get("ts")) == thread_ts else None
+            tail = messages[-(keep - 1):]
+            messages = ([root] if root else []) + tail
+        return {"ok": True, "messages": messages, "has_more": False}
 
     def _linked_thread_limit(self) -> int:
         try:
@@ -908,3 +1026,6 @@ def register(ctx) -> None:
         emoji="💼",
         allow_update_command=True,
     )
+    if _as_bool(os.environ.get("HERMES_SLACK_READ_TOOLS", "1")):
+        from . import slack_tools
+        slack_tools.register_tools(ctx)
