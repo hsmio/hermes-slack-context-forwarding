@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0 — Colleague mode
+
+Rewrite around one rule: inject the local conversation, reference everything else.
+
+- Add `solo_thread_follow`: thread follow-ups continue while one human is in the thread and need a mention once a second human writes or is mentioned there (`@here`/`@channel`/user groups count as several). Restricts, never extends, the bundled follow rules. Free-response channels and DMs are unaffected; lookup failures stay silent.
+- Add `thread_context_max_messages`: thread context is the root plus the newest replies (not Slack's oldest page), and the catch-up after a mention contains every message since Hermes' last turn except its own replies (up to 200). Both say how many messages were left out and how to read them. Threads are paged with per-page timeouts; very long threads keep the newest 1000 in memory.
+- Add read-only tools in a `slack` toolset: `slack_read_thread`, `slack_read_channel`, `slack_list_channels`, `slack_download_file`. Output is size-bounded; the token is sent only to the bundled adapter's Slack CDN hosts; downloads are byte-capped and expire after 7 days.
+- Render forwards of forwards inline with their source IDs; promote their files too.
+- Replace automatic linked-thread fetching with a one-line list of referenced Slack messages (`channel`/`ts`/`thread_ts`) for the tools. Remove `linked_thread_max_messages`.
+- Replace the provenance block (two `chat.getPermalink` calls and ~900 characters per message) with one line: IDs plus a permalink built from a cached `auth.test` workspace URL.
+- Remove the requester source-access layer (membership scans, shared deadlines, single-flight tasks): Slack's own visibility is the access boundary.
+- Thread and channel lines carry `[ts=…]` instead of `[Slack message: channel=… ts=…]`; backfilled messages show their reply count.
+- Rename the adapter class to `SlackColleagueAdapter`. Replace the 86 mock-heavy tests with 38 behaviour tests in four files, including thread scenarios.
+
 ## 0.3.1 — Inbound message provenance
 
 - Prepend current message and distinct thread-root channel/timestamp/permalink provenance to `event.channel_context`, independently of linked/forwarded sources and without changing command text.
