@@ -67,7 +67,7 @@ channels the bot is a member of.
 
 ## Compatibility
 
-Targets Hermes Agent 0.21.5–0.21.x (`requires_hermes: ">=0.21.5,<0.22.0"`). It
+Targets Hermes Agent 0.21.5–0.22.x (`requires_hermes: ">=0.21.5,<0.23.0"`). It
 overrides private adapter methods (`_channel_gate_allows`,
 `_fetch_thread_context`, `_conversations_replies_with_backoff`,
 `_collect_inbound_media`, `_thread_context_line`). Treat each Hermes minor
