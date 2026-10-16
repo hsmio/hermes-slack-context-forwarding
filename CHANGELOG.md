@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1 — Long threads are fully readable
+
+- `slack_read_thread` and `slack_read_channel` return every message instead of cutting the middle of long threads at 40k characters. Output is one entry per message (`[ts] author: text`) with a summary line first; files and forwards follow as indented lines.
+- Long results go through Hermes' tool-result spillover: above 40k characters (set on the tools' registry entries; Hermes' default is 100k) the full output is saved to a file and the model gets a preview that starts with the summary and reading instructions. Lines stay under `read_file`'s 2,000-character cut; continuation lines are indented, so message text can never pose as a new entry.
+- Add `after_ts` to `slack_read_thread` to continue past 1,000 messages or re-read from a point (for example when a spilled file has expired).
+- Messages are no longer silently cut at 2,000 characters (cap 20,000, with a marker).
+- Fix text duplication: Slack's `rich_text` blocks repeat the message text and were appended to it (a real 113-message thread rendered at 121k instead of 65k characters). Block text is now added only when it carries something new, such as section text.
+
 ## 0.4.0 — Colleague mode
 
 Rewrite around one rule: inject the local conversation, reference everything else.

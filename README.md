@@ -27,7 +27,7 @@ posted, or has a session). DMs and free-response channels are unaffected.
 
 **Read-only Slack tools** in a `slack` toolset:
 
-- `slack_read_thread`: opens a thread from a link or channel + ts, with forwards rendered recursively.
+- `slack_read_thread`: opens a whole thread from a link or channel + ts, with forwards rendered recursively. Long threads are saved to a file by Hermes' spillover and read with `read_file`; `after_ts` resumes from a given message.
 - `slack_read_channel`: reads recent top-level messages.
 - `slack_list_channels`: lists channels and shows which ones Hermes can read.
 - `slack_download_file`: saves a file locally for the file, document and vision tools.
