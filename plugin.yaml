@@ -1,10 +1,15 @@
 name: slack-context-forwarding
 label: Slack Colleague Mode
 kind: platform
-version: 0.4.1
+version: 0.4.2
 description: >
   Colleague mode for the bundled Slack adapter: multiplayer-aware thread follow-ups,
   newest-first thread context, forwards inline, references for everything else,
   and read-only Slack tools.
 author: Hugo
-requires_hermes: ">=0.21.5,<0.22.0"
+requires_hermes: ">=0.21.5,<0.23.0"
+provides_tools:
+  - slack_read_thread
+  - slack_read_channel
+  - slack_list_channels
+  - slack_download_file

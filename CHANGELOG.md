@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.2 — Hermes 0.22 compatibility
+
+- Widen `requires_hermes` to `>=0.21.5,<0.23.0`. The 45 tests pass, and `hermes plugins doctor`/`validate` report no warnings on both Hermes 0.21.5 (image `v2026.9.24`) and 0.22.2. Every overridden adapter method and every Hermes API the plugin calls has the same signature in both versions.
+- Declare `provides_tools` in the manifest.
+
 ## 0.4.1 — Long threads are fully readable
 
 - `slack_read_thread` and `slack_read_channel` return every message instead of cutting the middle of long threads at 40k characters. Output is one entry per message (`[ts] author: text`) with a summary line first; files and forwards follow as indented lines.
